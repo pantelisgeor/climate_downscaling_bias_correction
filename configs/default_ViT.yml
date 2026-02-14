@@ -1,0 +1,59 @@
+# configs/vit_config.yml
+model:
+  static_channels: 3
+  dynamic_channels: 16
+  image_size: [35, 77]
+  
+  encoder_type: "vit"  # Use ViT
+  encoder_dim: 512
+  encoder_blocks: 6  # ViT typically needs more layers than CNN
+  
+  # ViT-specific parameters (add these)
+  vit_patch_size: 7  # 35/7=5, 77/7=11 patches
+  vit_num_heads: 8
+  vit_mlp_ratio: 4.0
+  vit_dropout: 0.1
+  vit_attention_dropout: 0.1
+  
+  decoder_hidden_dims: [512, 256, 128, 64]
+  target_vars: ["tasERA", "tasmaxERA", "tpERA", "rhERA"]
+  
+  use_film: true
+  num_leads: 11
+  lead_embed_dim: 128
+
+optimizer:
+  type: "adamw"
+  lr: 5e-4  # ViT needs higher LR than CNN (3e-4 vs 1e-4)
+  weight_decay: 0.005  # Higher weight decay for ViT
+  betas: [0.9, 0.999]
+
+scheduler:
+  type: "cosine"
+  min_lr: 0.00001  # Higher min LR
+
+training:
+  batch_size: 256  # ViT benefits from larger batches
+  max_epochs: 150  # ViT needs more epochs
+  stage1_epochs: 75
+  gradient_clip_val: 1.0
+  early_stopping_patience: 10
+  use_amp: true
+
+# Data configuration
+data:
+  nc_path: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models/preprocessed_data/decadal_for_training/full_dataset.nc"
+  cache_dir: "./cache"
+  load_in_memory: true
+  normalize: true
+  normalize_method: "minmax"  # "minmax" or "zscore"
+  
+  # Year-based splits
+  train_years: [1981, 1982, 1983, 1984, 1985, 1986, 1987, 1988, 1989,
+                1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999,
+                2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009,
+                2010, 2011, 2012]
+  val_years: [2013, 2014, 2015, 2016]
+  test_years: [2017, 2018, 2019, 2020]
+  
+  num_workers: 12
