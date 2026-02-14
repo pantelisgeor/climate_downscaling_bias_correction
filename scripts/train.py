@@ -226,9 +226,122 @@ def create_data_loaders(
 
     # Fit normalizer on training set (only rank 0 needs to do this)
     if config["data"]["normalize"] and rank == 0:
-        logger.info("Fitting normalizer on training set...")
-        # Normalizer fitting code here (same as before)
-        # ...
+        logger.info("=" * 70)
+        logger.info("FITTING NORMALIZER ON TRAINING DATA")
+        logger.info("=" * 70)
+
+        # Variables to normalize
+        static_vars = ["dem", "rho", "phi"]
+        dynamic_vars = ["pr", "tas", "tasmax", "hurs", "sin_time", "cos_time"]
+        cci_vars = ["cci_agg"]  # CCI aggregate (10 classes, normalized together)
+        target_vars = config["model"]["target_vars"]
+
+        # Sample indices for statistics computation
+        sample_size = min(1000, len(splits["train"]))
+        logger.info(
+            f"Sampling {sample_size} training samples for normalization statistics..."
+        )
+        sample_indices = np.random.choice(splits["train"], sample_size, replace=False)
+
+        # Collect values for each variable
+        var_values = {
+            var: [] for var in static_vars + dynamic_vars + cci_vars + target_vars
+        }
+
+        logger.info("Collecting data from samples...")
+        for i, idx in enumerate(sample_indices):
+            if (i + 1) % 200 == 0:
+                logger.info(f"  Processed {i + 1}/{sample_size} samples...")
+
+            try:
+                inputs, targets = data_loader[idx]
+
+                # Static vars (indices 0-2: dem, rho, phi)
+                for i, var in enumerate(static_vars):
+                    var_values[var].append(inputs[i].flatten())
+
+                # Dynamic vars (indices 3-8: pr, tas, tasmax, hurs, sin_time, cos_time)
+                for i, var in enumerate(dynamic_vars):
+                    var_values[var].append(inputs[i + 3].flatten())
+
+                # CCI aggregate (indices 9-18: 10 land cover classes)
+                cci_data = inputs[9:19].flatten()
+                var_values["cci_agg"].append(cci_data)
+
+                # Target variables
+                for i, var in enumerate(target_vars):
+                    var_values[var].append(targets[i].flatten())
+
+            except Exception as e:
+                logger.warning(f"  Error processing sample {idx}: {e}")
+                continue
+
+        # Compute and store normalization parameters
+        logger.info("\nComputing normalization parameters:")
+        logger.info("-" * 70)
+
+        for var_name, values_list in var_values.items():
+            if len(values_list) == 0:
+                logger.warning(f"  {var_name:15s}: No data collected, skipping")
+                continue
+
+            all_values = np.concatenate(values_list)
+
+            if config["data"]["normalize_method"] == "minmax":
+                vmin = float(np.nanmin(all_values))
+                vmax = float(np.nanmax(all_values))
+
+                # Avoid division by zero
+                if vmax - vmin < 1e-8:
+                    logger.warning(
+                        f"  {var_name:15s}: Constant values detected, using [0, 1] range"
+                    )
+                    vmax = vmin + 1.0
+
+                data_loader.scalers[var_name] = {"min": vmin, "max": vmax}
+                logger.info(f"  {var_name:15s}: min={vmin:12.4f}, max={vmax:12.4f}")
+
+            elif config["data"]["normalize_method"] == "zscore":
+                vmean = float(np.nanmean(all_values))
+                vstd = float(np.nanstd(all_values))
+
+                # Avoid division by zero
+                if vstd < 1e-8:
+                    logger.warning(
+                        f"  {var_name:15s}: Zero std detected, using std=1.0"
+                    )
+                    vstd = 1.0
+
+                data_loader.scalers[var_name] = {"mean": vmean, "std": vstd}
+                logger.info(f"  {var_name:15s}: mean={vmean:12.4f}, std={vstd:12.4f}")
+
+        logger.info("-" * 70)
+        logger.info(
+            f"✓ Successfully fitted normalizer for {len(data_loader.scalers)} variables"
+        )
+        logger.info("=" * 70)
+
+        # Save normalization parameters for reproducibility
+        scaler_path = exp_dir / "normalization_params.json"
+        with open(scaler_path, "w") as f:
+            json.dump(data_loader.scalers, f, indent=2)
+        logger.info(f"Normalization parameters saved to: {scaler_path}\n")
+
+    # Synchronize all processes (wait for rank 0 to finish fitting)
+    if is_distributed:
+        dist.barrier()
+
+        # Broadcast scalers from rank 0 to all other ranks
+        if rank == 0:
+            scaler_list = [data_loader.scalers]
+        else:
+            scaler_list = [None]
+
+        dist.broadcast_object_list(scaler_list, src=0)
+
+        if rank != 0:
+            data_loader.scalers = scaler_list[0]
+            logger.info(f"Rank {rank}: Received normalization parameters from rank 0")
 
     # Create distributed samplers if using DDP
     if is_distributed:
@@ -301,6 +414,11 @@ def create_model(config: dict) -> ClimateNet:
         num_leads=config["model"]["num_leads"],
         lead_embed_dim=config["model"]["lead_embed_dim"],
     )
+
+    # Add ViT-specific parameters if using ViT encoder
+    if config["model"]["encoder_type"] == "vit":
+        # These will be passed to VisionTransformerEncoder
+        pass
 
     param_counts = model.count_parameters()
     logger.info(f"Model created: {param_counts['total_millions']:.2f}M parameters")

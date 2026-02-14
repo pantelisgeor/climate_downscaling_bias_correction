@@ -522,37 +522,55 @@ class DecadalDataLoader:
 
         if self.normalize_method == "minmax":
             if fit:
-                min_val = np.nanmin(data)
-                max_val = np.nanmax(data)
-                if min_val == max_val:
+                min_val = float(np.nanmin(data))
+                max_val = float(np.nanmax(data))
+                if abs(max_val - min_val) < 1e-8:
                     logger.warning(
                         f"Variable {var_name} has constant value {min_val}, "
-                        f"normalization may produce zeros"
+                        f"using range [0, 1] to avoid division by zero"
                     )
-                self.scalers[var_name] = (min_val, max_val)
+                    max_val = min_val + 1.0
+                self.scalers[var_name] = {"min": min_val, "max": max_val}
                 logger.debug(
                     f"Fitted minmax scaler for {var_name}: [{min_val:.4f}, {max_val:.4f}]"
                 )
+            else:
+                # Retrieve and convert to float (handles both dict and any stored format)
+                scaler = self.scalers[var_name]
+                if isinstance(scaler, dict):
+                    min_val = float(scaler["min"])
+                    max_val = float(scaler["max"])
+                else:
+                    # Legacy tuple format
+                    min_val, max_val = float(scaler[0]), float(scaler[1])
 
-            min_val, max_val = self.scalers[var_name]
             return (data - min_val) / (max_val - min_val + 1e-8)
 
         elif self.normalize_method == "zscore":
             if fit:
-                mean = np.nanmean(data)
-                std = np.nanstd(data)
-                if std == 0:
+                mean_val = float(np.nanmean(data))
+                std_val = float(np.nanstd(data))
+                if std_val < 1e-8:
                     logger.warning(
                         f"Variable {var_name} has zero standard deviation, "
-                        f"normalization may produce zeros"
+                        f"using std=1.0 to avoid division by zero"
                     )
-                self.scalers[var_name] = (mean, std)
+                    std_val = 1.0
+                self.scalers[var_name] = {"mean": mean_val, "std": std_val}
                 logger.debug(
-                    f"Fitted zscore scaler for {var_name}: mean={mean:.4f}, std={std:.4f}"
+                    f"Fitted zscore scaler for {var_name}: mean={mean_val:.4f}, std={std_val:.4f}"
                 )
+            else:
+                # Retrieve and convert to float
+                scaler = self.scalers[var_name]
+                if isinstance(scaler, dict):
+                    mean_val = float(scaler["mean"])
+                    std_val = float(scaler["std"])
+                else:
+                    # Legacy tuple format
+                    mean_val, std_val = float(scaler[0]), float(scaler[1])
 
-            mean, std = self.scalers[var_name]
-            return (data - mean) / (std + 1e-8)
+            return (data - mean_val) / (std_val + 1e-8)
 
     def denormalize(self, data: np.ndarray, var_name: str) -> np.ndarray:
         """
@@ -574,13 +592,23 @@ class DecadalDataLoader:
                 f"Cannot denormalize without first normalizing."
             )
 
+        scaler = self.scalers[var_name]
+
         if self.normalize_method == "minmax":
-            min_val, max_val = self.scalers[var_name]
+            if isinstance(scaler, dict):
+                min_val = float(scaler["min"])
+                max_val = float(scaler["max"])
+            else:
+                min_val, max_val = float(scaler[0]), float(scaler[1])
             return data * (max_val - min_val) + min_val
 
         elif self.normalize_method == "zscore":
-            mean, std = self.scalers[var_name]
-            return data * std + mean
+            if isinstance(scaler, dict):
+                mean_val = float(scaler["mean"])
+                std_val = float(scaler["std"])
+            else:
+                mean_val, std_val = float(scaler[0]), float(scaler[1])
+            return data * std_val + mean_val
 
     def __len__(self) -> int:
         """
@@ -635,8 +663,7 @@ class DecadalDataLoader:
                     # cci_agg has shape (time, cci_class=10, lat, lon)
                     # Extract for this time and flatten all 10 classes
                     data = var_data.isel(time=time_idx).values  # Shape: (10, lat, lon)
-                    # Flatten to (10 * lat * lon,) but we want to keep as separate channels
-                    # So reshape to (10, lat*lon) then we'll handle it in the dataset
+                    # Flatten to (10, lat*lon)
                     n_classes = data.shape[0]
                     H, W = data.shape[1], data.shape[2]
                     data = data.reshape(n_classes, H * W)  # Shape: (10, H*W)

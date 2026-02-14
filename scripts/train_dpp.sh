@@ -11,4 +11,4 @@ torchrun \
     --master_addr=localhost \
     --master_port=29500 \
     scripts/train.py \
-    --config configs/default.yml
+    --config $1
