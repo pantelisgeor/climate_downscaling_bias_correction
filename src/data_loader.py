@@ -502,6 +502,8 @@ class DecadalDataLoader:
         """
         Normalize data using the specified method.
 
+        Applies log1p transform to precipitation (tpERA) before normalization.
+
         Args:
             data: Input data array to normalize
             var_name: Variable name (used as key for storing/retrieving scaler params)
@@ -520,6 +522,10 @@ class DecadalDataLoader:
                 f"Must call normalize with fit=True first."
             )
 
+        # Apply log transform to precipitation
+        if var_name == "tpERA":
+            data = np.log1p(np.maximum(data, 0))
+
         if self.normalize_method == "minmax":
             if fit:
                 min_val = float(np.nanmin(data))
@@ -535,13 +541,12 @@ class DecadalDataLoader:
                     f"Fitted minmax scaler for {var_name}: [{min_val:.4f}, {max_val:.4f}]"
                 )
             else:
-                # Retrieve and convert to float (handles both dict and any stored format)
+                # Retrieve and convert to float
                 scaler = self.scalers[var_name]
                 if isinstance(scaler, dict):
                     min_val = float(scaler["min"])
                     max_val = float(scaler["max"])
                 else:
-                    # Legacy tuple format
                     min_val, max_val = float(scaler[0]), float(scaler[1])
 
             return (data - min_val) / (max_val - min_val + 1e-8)
@@ -567,7 +572,6 @@ class DecadalDataLoader:
                     mean_val = float(scaler["mean"])
                     std_val = float(scaler["std"])
                 else:
-                    # Legacy tuple format
                     mean_val, std_val = float(scaler[0]), float(scaler[1])
 
             return (data - mean_val) / (std_val + 1e-8)
@@ -575,6 +579,8 @@ class DecadalDataLoader:
     def denormalize(self, data: np.ndarray, var_name: str) -> np.ndarray:
         """
         Denormalize data using stored normalization parameters.
+
+        Applies inverse log1p transform to precipitation (tpERA) after denormalization.
 
         Args:
             data: Normalized data array
@@ -600,7 +606,7 @@ class DecadalDataLoader:
                 max_val = float(scaler["max"])
             else:
                 min_val, max_val = float(scaler[0]), float(scaler[1])
-            return data * (max_val - min_val) + min_val
+            denorm_data = data * (max_val - min_val) + min_val
 
         elif self.normalize_method == "zscore":
             if isinstance(scaler, dict):
@@ -608,7 +614,13 @@ class DecadalDataLoader:
                 std_val = float(scaler["std"])
             else:
                 mean_val, std_val = float(scaler[0]), float(scaler[1])
-            return data * std_val + mean_val
+            denorm_data = data * std_val + mean_val
+
+        # Apply inverse log transform for precipitation
+        if var_name == "tpERA":
+            denorm_data = np.expm1(denorm_data)
+
+        return denorm_data
 
     def __len__(self) -> int:
         """

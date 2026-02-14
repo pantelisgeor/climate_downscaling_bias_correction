@@ -55,7 +55,7 @@ class UncertaintyWeighting(nn.Module):
             task_losses: Dictionary mapping task names to loss values
 
         Returns:
-            Dictionary with weighted losses and total loss
+            Tuple of (weighted_losses dict, weights dict)
         """
         weighted_losses = {}
         total_loss = 0.0
@@ -63,7 +63,11 @@ class UncertaintyWeighting(nn.Module):
         for i, task in enumerate(self.task_names):
             if task in task_losses:
                 loss = task_losses[task]
-                log_var = self.log_vars[i]
+
+                # Clamp log_var to prevent extreme values and instability
+                # log_var in [-7, 5] means sigma in [0.03, 12.2]
+                # This gives weights in [0.007, 1096] which is reasonable
+                log_var = self.log_vars[i].clamp(-7.0, 5.0)
 
                 # Weighted loss: 1/(2*sigma^2) * L + log(sigma)
                 # = 1/2 * exp(-log_var) * L + 0.5 * log_var
@@ -75,13 +79,10 @@ class UncertaintyWeighting(nn.Module):
 
         weighted_losses["total_weighted"] = total_loss
 
-        # Also store the learned uncertainties (sigma = exp(0.5 * log_var))
-        uncertainties = {}
-        for i, task in enumerate(self.task_names):
-            sigma = torch.exp(0.5 * self.log_vars[i])
-            uncertainties[task] = sigma.item()
+        # Get current weights for logging
+        weights = self.get_weights()
 
-        return weighted_losses, uncertainties
+        return weighted_losses, weights
 
     def get_weights(self) -> Dict[str, float]:
         """
@@ -97,6 +98,21 @@ class UncertaintyWeighting(nn.Module):
             weights[task] = weight
 
         return weights
+
+    def get_uncertainties(self) -> Dict[str, float]:
+        """
+        Get current task uncertainties (sigma).
+
+        Returns:
+            Dictionary mapping task names to uncertainty values
+        """
+        uncertainties = {}
+        for i, task in enumerate(self.task_names):
+            # Uncertainty = sigma = exp(0.5 * log_var)
+            sigma = torch.exp(0.5 * self.log_vars[i]).item()
+            uncertainties[task] = sigma
+
+        return uncertainties
 
 
 class DynamicWeightAverage(nn.Module):
@@ -150,7 +166,7 @@ class DynamicWeightAverage(nn.Module):
             for history in self.loss_history.values()
         ):
             # Not enough history, use uniform weights
-            return {task: 1.0 / self.num_tasks for task in self.task_names}
+            return {task: 1.0 for task in self.task_names}
 
         # Compute loss ratios (current / previous window average)
         loss_ratios = []
@@ -177,7 +193,7 @@ class DynamicWeightAverage(nn.Module):
             task_losses: Dictionary mapping task names to loss values
 
         Returns:
-            Dictionary with weighted losses and total loss
+            Tuple of (weighted_losses dict, weights dict)
         """
         # Update history
         self.update_history(task_losses)
@@ -255,7 +271,7 @@ class GradientNormalization(nn.Module):
             task_losses: Dictionary mapping task names to loss values
 
         Returns:
-            Dictionary with weighted losses and total loss
+            Tuple of (weighted_losses dict, weights dict)
         """
         weighted_losses = {}
         total_loss = 0.0

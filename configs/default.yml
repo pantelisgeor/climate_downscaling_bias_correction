@@ -23,7 +23,7 @@ data:
   val_years: [2013, 2014, 2015, 2016]
   test_years: [2017, 2018, 2019, 2020]
   
-  num_workers: 24
+  num_workers: 12
 
 # Model architecture
 model:
@@ -45,7 +45,7 @@ model:
 
 # Loss function
 loss:
-  weighting_strategy: "uncertainty"  # "uncertainty", "dwa", "gradnorm", "equal"
+  weighting_strategy: "equal"  # "uncertainty", "dwa", "gradnorm", "equal"
   physics_weight: 0.1
   use_physics: true
   
@@ -77,7 +77,7 @@ scheduler:
 
 # Training configuration
 training:
-  batch_size: 256
+  batch_size: 245
   max_epochs: 100
   stage1_epochs: 50  # Data loss only
   gradient_clip_val: 1.0
@@ -85,6 +85,7 @@ training:
   save_every_n_epochs: 5
   val_interval: 1
   use_amp: true  # Automatic Mixed Precision
+  device: "cuda"
 
 # Logging
 logging:
