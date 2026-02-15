@@ -100,6 +100,63 @@ def create_experiment_directory(config: dict, rank: int = 0) -> Path:
         return None
 
 
+def get_year_from_time_index(data_loader, time_idx: int) -> int:
+    """Extract year from time index."""
+    import pandas as pd
+
+    time_value = data_loader.ds.time.values[time_idx]
+    timestamp = pd.Timestamp(time_value)
+    return timestamp.year
+
+
+def create_year_based_splits(
+    data_loader,
+    train_years: list,
+    val_years: list,
+    test_years: list,
+) -> dict:
+    """Create train/val/test splits based on years."""
+    logger = logging.getLogger(__name__)
+
+    logger.info("Creating year-based data splits...")
+    logger.info(
+        f"  Train years: {min(train_years)}-{max(train_years)} ({len(train_years)} years)"
+    )
+    logger.info(
+        f"  Val years: {min(val_years)}-{max(val_years)} ({len(val_years)} years)"
+    )
+    logger.info(
+        f"  Test years: {min(test_years)}-{max(test_years)} ({len(test_years)} years)"
+    )
+
+    valid_combos = data_loader.valid_combinations
+    train_indices = []
+    val_indices = []
+    test_indices = []
+
+    for idx in range(len(valid_combos)):
+        time_idx = valid_combos.iloc[idx]["time_idx"]
+        year = get_year_from_time_index(data_loader, time_idx)
+
+        if year in train_years:
+            train_indices.append(idx)
+        elif year in val_years:
+            val_indices.append(idx)
+        elif year in test_years:
+            test_indices.append(idx)
+
+    logger.info(f"Split sizes:")
+    logger.info(f"  Train: {len(train_indices):,} samples")
+    logger.info(f"  Val: {len(val_indices):,} samples")
+    logger.info(f"  Test: {len(test_indices):,} samples")
+
+    return {
+        "train": train_indices,
+        "val": val_indices,
+        "test": test_indices,
+    }
+
+
 def setup_distributed(rank: int, world_size: int, backend: str = "nccl"):
     """
     Initialize distributed training.
@@ -332,23 +389,24 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
         target_vars=config["model"]["target_vars"],
     )
 
-    # Split into train/val/test
-    total_size = len(full_dataset)
-    train_ratio = config["data"]["train_ratio"]
-    val_ratio = config["data"]["val_ratio"]
+    # Split into train/val/test based on YEARS (not ratios)
+    if rank == 0:
+        logger.info("Creating year-based data splits...")
+        logger.info(f"  Train years: {config['data']['train_years']}")
+        logger.info(f"  Val years: {config['data']['val_years']}")
+        logger.info(f"  Test years: {config['data']['test_years']}")
 
-    train_size = int(total_size * train_ratio)
-    val_size = int(total_size * val_ratio)
-    test_size = total_size - train_size - val_size
+    # Create splits based on years
+    splits = create_year_based_splits(
+        data_loader=data_loader,
+        train_years=config["data"]["train_years"],
+        val_years=config["data"]["val_years"],
+        test_years=config["data"]["test_years"],
+    )
 
-    # Use fixed indices for reproducibility
-    indices = np.arange(total_size)
-    np.random.seed(seed)
-    np.random.shuffle(indices)
-
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size : train_size + val_size]
-    test_indices = indices[train_size + val_size :]
+    train_indices = splits["train"]
+    val_indices = splits["val"]
+    test_indices = splits["test"]
 
     train_dataset = Subset(full_dataset, train_indices)
     val_dataset = Subset(full_dataset, val_indices)
@@ -356,11 +414,26 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
 
     if rank == 0:
         logger.info(f"Dataset split:")
-        logger.info(f"  Train: {len(train_dataset):,} samples ({train_ratio*100:.1f}%)")
-        logger.info(f"  Val:   {len(val_dataset):,} samples ({val_ratio*100:.1f}%)")
-        logger.info(
-            f"  Test:  {len(test_dataset):,} samples ({(1-train_ratio-val_ratio)*100:.1f}%)"
-        )
+        logger.info(f"  Train: {len(train_dataset):,} samples")
+        logger.info(f"  Val:   {len(val_dataset):,} samples")
+        logger.info(f"  Test:  {len(test_dataset):,} samples")
+
+        # Save split indices
+        split_path = exp_dir / "data_splits.json"
+        with open(split_path, "w") as f:
+            json.dump(
+                {
+                    "train_indices": train_indices,
+                    "val_indices": val_indices,
+                    "test_indices": test_indices,
+                    "train_years": config["data"]["train_years"],
+                    "val_years": config["data"]["val_years"],
+                    "test_years": config["data"]["test_years"],
+                },
+                f,
+                indent=2,
+            )
+        logger.info(f"Data splits saved to: {split_path}")
 
     # Create data loaders
     if world_size > 1:
@@ -416,16 +489,17 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
         logger.info("=" * 70)
 
     model = ClimateNet(
-        in_channels=config["model"]["in_channels"],
-        out_channels=config["model"]["out_channels"],
-        img_size=config["model"]["img_size"],
-        patch_size=config["model"]["patch_size"],
-        embed_dim=config["model"]["embed_dim"],
-        depth=config["model"]["depth"],
-        num_heads=config["model"]["num_heads"],
-        mlp_ratio=config["model"]["mlp_ratio"],
-        dropout=config["model"]["dropout"],
+        static_channels=config["model"]["static_channels"],
+        dynamic_channels=config["model"]["dynamic_channels"],
+        image_size=config["model"]["image_size"],
+        encoder_type=config["model"]["encoder_type"],
+        encoder_dim=config["model"]["encoder_dim"],
+        encoder_blocks=config["model"]["encoder_blocks"],
+        decoder_hidden_dims=config["model"]["decoder_hidden_dims"],
         target_vars=config["model"]["target_vars"],
+        use_film=config["model"]["use_film"],
+        num_leads=config["model"]["num_leads"],
+        lead_embed_dim=config["model"]["lead_embed_dim"],
     )
 
     model = model.to(device)
@@ -436,6 +510,8 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
         logger.info(f"Model parameters:")
         logger.info(f"  Total:     {total_params:,}")
         logger.info(f"  Trainable: {trainable_params:,}")
+        logger.info(f"  Architecture: {config['model']['encoder_type']}")
+        logger.info(f"  Image size: {config['model']['image_size']}")
 
     # Wrap model with DDP if using multiple GPUs
     if world_size > 1:
@@ -451,18 +527,23 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
         logger.info("LOSS FUNCTION")
         logger.info("=" * 70)
 
-    criterion = CombinedLoss(  # <-- Use CombinedLoss instead
-        task_names=config["model"]["target_vars"],
-        loss_types=config["loss"]["loss_types"],
+    criterion = CombinedLoss(
+        target_vars=config["model"]["target_vars"],
         weighting_strategy=config["loss"]["weighting_strategy"],
-        initial_weights=config["loss"].get("initial_weights"),
-        device=device,
-    )
+        physics_weight=config["loss"].get("physics_weight", 0.1),
+        use_physics=config["loss"].get("use_physics", False),
+        use_clausius_clapeyron=config["loss"].get("use_clausius_clapeyron", False),
+        use_temp_consistency=config["loss"].get("use_temp_consistency", False),
+        use_humidity_bounds=config["loss"].get("use_humidity_bounds", False),
+        use_precip_non_negativity=config["loss"].get(
+            "use_precip_non_negativity", False
+        ),
+        use_spatial_smoothness=config["loss"].get("use_spatial_smoothness", False),
+    ).to(device)
 
     if rank == 0:
         logger.info(f"Loss configuration:")
         logger.info(f"  Strategy: {config['loss']['weighting_strategy']}")
-        logger.info(f"  Loss types: {config['loss']['loss_types']}")
 
     # =========================================================================
     # OPTIMIZER & SCHEDULER
