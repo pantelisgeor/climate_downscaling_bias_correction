@@ -78,11 +78,34 @@ def save_config(config: dict, save_path: Path):
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
 
-def create_experiment_directory(config: dict, rank: int = 0) -> Path:
+def create_experiment_directory(
+    config: dict, rank: int = 0, resume_path: str = None
+) -> Path:
     """
     Create experiment directory (only on rank 0).
     """
     if rank == 0:
+        # When resuming, keep using the SAME experiment directory.
+        if resume_path is not None:
+            checkpoint_path = Path(resume_path).resolve()
+            if not checkpoint_path.exists():
+                raise FileNotFoundError(f"Resume checkpoint not found: {checkpoint_path}")
+
+            # Expected layout: <exp_dir>/checkpoints/<checkpoint>.pt
+            if checkpoint_path.parent.name == "checkpoints":
+                exp_dir = checkpoint_path.parent.parent
+            else:
+                # Fallback: treat checkpoint parent as experiment directory
+                exp_dir = checkpoint_path.parent
+
+            # Ensure expected subdirs exist (idempotent for existing runs)
+            (exp_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+            (exp_dir / "logs").mkdir(exist_ok=True)
+            (exp_dir / "results").mkdir(exist_ok=True)
+            (exp_dir / "figures").mkdir(exist_ok=True)
+
+            return exp_dir
+
         base_dir = Path(config["experiment"]["base_dir"])
         experiment_name = config["experiment"]["name"]
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -157,7 +180,9 @@ def create_year_based_splits(
     }
 
 
-def setup_distributed(rank: int, world_size: int, backend: str = "nccl"):
+def setup_distributed(
+    rank: int, world_size: int, backend: str = "nccl", local_rank: int = None
+):
     """
     Initialize distributed training.
 
@@ -166,11 +191,13 @@ def setup_distributed(rank: int, world_size: int, backend: str = "nccl"):
         world_size: Total number of processes
         backend: Communication backend ('nccl' for GPU, 'gloo' for CPU)
     """
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
+    os.environ.setdefault("MASTER_ADDR", "localhost")
+    os.environ.setdefault("MASTER_PORT", "12355")
 
     dist.init_process_group(backend, rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
+    if torch.cuda.is_available():
+        device_idx = rank if local_rank is None else local_rank
+        torch.cuda.set_device(device_idx)
 
 
 def cleanup_distributed():
@@ -178,7 +205,13 @@ def cleanup_distributed():
     dist.destroy_process_group()
 
 
-def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
+def main(
+    rank: int,
+    world_size: int,
+    config_path: str,
+    resume_path: str = None,
+    local_rank: int = None,
+):
     """
     Main training function.
 
@@ -193,10 +226,10 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
 
     # Setup distributed training if world_size > 1
     if world_size > 1:
-        setup_distributed(rank, world_size)
+        setup_distributed(rank, world_size, local_rank=local_rank)
 
     # Create experiment directory (only rank 0)
-    exp_dir = create_experiment_directory(config, rank)
+    exp_dir = create_experiment_directory(config, rank, resume_path=resume_path)
 
     # Broadcast experiment directory path to all ranks
     if world_size > 1:
@@ -208,7 +241,9 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
     logger = setup_logger(
         exp_dir / "logs",
         rank=rank,
-        log_level=config.get("logging", {}).get("level", "INFO"),
+        log_level=config.get("logging", {}).get(
+            "level", config.get("logging", {}).get("log_level", "INFO")
+        ),
     )
 
     # Save configuration (rank 0 only)
@@ -224,9 +259,9 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
         logger.info("=" * 70)
 
     # Set device
-    # Set device
     if world_size > 1:
-        device = f"cuda:{rank}"
+        device_idx = rank if local_rank is None else local_rank
+        device = f"cuda:{device_idx}"
     else:
         device = config["training"].get(
             "device", "cuda" if torch.cuda.is_available() else "cpu"
@@ -235,7 +270,7 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
     logger.info(f"Using device: {device}")
 
     # Set random seeds for reproducibility
-    seed = config["training"].get("seed", 42)
+    seed = config.get("seed", 42)
     torch.manual_seed(seed + rank)
     np.random.seed(seed + rank)
     if torch.cuda.is_available():
@@ -248,13 +283,47 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
     logger.info("DATA LOADING")
     logger.info("=" * 70)
 
+    # Optional mode: rank 0 serves batches to all other ranks via broadcast.
+    rank0_batch_broadcast = config["data"].get("rank0_batch_broadcast", False)
+
     # Create data loader
-    data_loader = DecadalDataLoader(
-        nc_path=config["data"]["nc_path"],
-        normalize_method=config["data"]["normalize_method"],
-        cache_dir=config["data"]["cache_dir"],
-        load_in_memory=config["data"]["load_in_memory"],
-    )
+    # Optional mode: only rank 0 performs in-memory loading while other ranks
+    # use lazy loading from disk. Default behavior remains unchanged.
+    rank0_only_in_memory = config["data"].get("rank0_only_in_memory_load", False)
+
+    if world_size > 1 and rank0_only_in_memory:
+        if rank == 0:
+            logger.info(
+                "rank0_only_in_memory_load enabled: rank 0 loads in memory, other ranks use lazy loading"
+            )
+            data_loader = DecadalDataLoader(
+                nc_path=config["data"]["nc_path"],
+                normalize_method=config["data"]["normalize_method"],
+                cache_dir=config["data"]["cache_dir"],
+                load_in_memory=config["data"]["load_in_memory"],
+            )
+
+        # Ensure rank 0 finishes potential cache creation first.
+        dist.barrier()
+
+        if rank != 0:
+            data_loader = DecadalDataLoader(
+                nc_path=config["data"]["nc_path"],
+                normalize_method=config["data"]["normalize_method"],
+                cache_dir=config["data"]["cache_dir"],
+                load_in_memory=False,
+            )
+    else:
+        data_loader = DecadalDataLoader(
+            nc_path=config["data"]["nc_path"],
+            normalize_method=config["data"]["normalize_method"],
+            cache_dir=config["data"]["cache_dir"],
+            load_in_memory=config["data"]["load_in_memory"],
+        )
+
+    train_loader = None
+    val_loader = None
+    test_loader = None
 
     # Variables to normalize
     static_vars = ["dem", "rho", "phi"]
@@ -262,21 +331,44 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
     cci_vars = ["cci_agg"]  # CCI aggregate (10 classes, normalized together)
     target_vars = config["model"]["target_vars"]
 
+    if world_size > 1 and rank0_batch_broadcast and rank != 0:
+        # Non-zero ranks skip dataset iteration and receive batches from rank 0.
+        train_indices = []
+        val_indices = []
+        test_indices = []
+    else:
+        # Create splits before normalization so scalers are fitted on TRAIN years only.
+        splits = create_year_based_splits(
+            data_loader=data_loader,
+            train_years=config["data"]["train_years"],
+            val_years=config["data"]["val_years"],
+            test_years=config["data"]["test_years"],
+        )
+
+        train_indices = splits["train"]
+        val_indices = splits["val"]
+        test_indices = splits["test"]
+
     # Fit normalizer on training set (only rank 0 needs to do this)
-    if config["data"]["normalize"] and rank == 0:
+    if config["data"]["normalize"] and rank == 0 and data_loader is not None:
         logger.info("=" * 70)
         logger.info("FITTING NORMALIZER ON TRAINING DATA")
         logger.info("=" * 70)
 
         # Determine sample size for fitting
-        total_samples = len(data_loader)
-        sample_size = min(config["data"].get("normalize_samples", 1000), total_samples)
+        total_samples = len(train_indices)
+        if total_samples == 0:
+            raise ValueError(
+                "No training samples found for configured train_years; cannot fit normalizer"
+            )
+        sample_size = min(config["data"].get("normalize_samples", 40000), total_samples)
 
         logger.info(f"Total available samples: {total_samples:,}")
         logger.info(f"Using {sample_size:,} samples for normalization fitting")
 
-        # Sample uniformly across the dataset
-        sample_indices = np.linspace(0, total_samples - 1, sample_size, dtype=int)
+        # Sample uniformly across the training set only
+        sample_positions = np.linspace(0, total_samples - 1, sample_size, dtype=int)
+        sample_indices = [train_indices[pos] for pos in sample_positions]
 
         # Collect values for each variable
         var_values = {
@@ -291,13 +383,16 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
             try:
                 inputs, targets = data_loader[idx]
 
-                # Static vars (indices 0-2: dem, rho, phi)
+                # Static vars (indices 4-6: dem, rho, phi)
                 for i, var in enumerate(static_vars):
-                    var_values[var].append(inputs[i].flatten())
+                    var_values[var].append(inputs[i + 4].flatten())
 
-                # Dynamic vars (indices 3-8: pr, tas, tasmax, hurs, sin_time, cos_time)
+                # Dynamic vars (indices 0-3, 7-8: pr, tas, tasmax, hurs, sin_time, cos_time)
                 for i, var in enumerate(dynamic_vars):
-                    var_values[var].append(inputs[i + 3].flatten())
+                    if i < 4:
+                        var_values[var].append(inputs[i].flatten())
+                    else:
+                        var_values[var].append(inputs[i + 3].flatten())
 
                 # CCI vars (indices 9-18: 10 classes)
                 # Collect all 10 classes together
@@ -373,112 +468,102 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
         # Rank 0 broadcasts scalers
         scalers_list = [data_loader.scalers if rank == 0 else None]
         dist.broadcast_object_list(scalers_list, src=0)
-        data_loader.scalers = scalers_list[0]
+        if data_loader is not None:
+            data_loader.scalers = scalers_list[0]
 
         if rank != 0:
             logger.info("Received normalization parameters from rank 0")
 
-    # Create full dataset
-    if rank == 0:
-        logger.info("Creating datasets...")
+    if not (world_size > 1 and rank0_batch_broadcast and rank != 0):
+        # Create full dataset
+        if rank == 0:
+            logger.info("Creating datasets...")
 
-    full_dataset = ClimateDataset(
-        data_loader=data_loader,
-        normalize=config["data"]["normalize"],
-        fit_normalizer=False,  # Already fitted above
-        target_vars=config["model"]["target_vars"],
-    )
+        full_dataset = ClimateDataset(
+            data_loader=data_loader,
+            normalize=config["data"]["normalize"],
+            image_size=config["model"]["image_size"],
+            target_vars=config["model"]["target_vars"],
+        )
 
-    # Split into train/val/test based on YEARS (not ratios)
-    if rank == 0:
-        logger.info("Creating year-based data splits...")
-        logger.info(f"  Train years: {config['data']['train_years']}")
-        logger.info(f"  Val years: {config['data']['val_years']}")
-        logger.info(f"  Test years: {config['data']['test_years']}")
+        train_dataset = Subset(full_dataset, train_indices)
+        val_dataset = Subset(full_dataset, val_indices)
+        test_dataset = Subset(full_dataset, test_indices)
 
-    # Create splits based on years
-    splits = create_year_based_splits(
-        data_loader=data_loader,
-        train_years=config["data"]["train_years"],
-        val_years=config["data"]["val_years"],
-        test_years=config["data"]["test_years"],
-    )
+        if rank == 0:
+            logger.info(f"Dataset split:")
+            logger.info(f"  Train: {len(train_dataset):,} samples")
+            logger.info(f"  Val:   {len(val_dataset):,} samples")
+            logger.info(f"  Test:  {len(test_dataset):,} samples")
 
-    train_indices = splits["train"]
-    val_indices = splits["val"]
-    test_indices = splits["test"]
+            # Save split indices
+            split_path = exp_dir / "data_splits.json"
+            with open(split_path, "w") as f:
+                json.dump(
+                    {
+                        "train_indices": train_indices,
+                        "val_indices": val_indices,
+                        "test_indices": test_indices,
+                        "train_years": config["data"]["train_years"],
+                        "val_years": config["data"]["val_years"],
+                        "test_years": config["data"]["test_years"],
+                    },
+                    f,
+                    indent=2,
+                )
+            logger.info(f"Data splits saved to: {split_path}")
 
-    train_dataset = Subset(full_dataset, train_indices)
-    val_dataset = Subset(full_dataset, val_indices)
-    test_dataset = Subset(full_dataset, test_indices)
-
-    if rank == 0:
-        logger.info(f"Dataset split:")
-        logger.info(f"  Train: {len(train_dataset):,} samples")
-        logger.info(f"  Val:   {len(val_dataset):,} samples")
-        logger.info(f"  Test:  {len(test_dataset):,} samples")
-
-        # Save split indices
-        split_path = exp_dir / "data_splits.json"
-        with open(split_path, "w") as f:
-            json.dump(
-                {
-                    "train_indices": train_indices,
-                    "val_indices": val_indices,
-                    "test_indices": test_indices,
-                    "train_years": config["data"]["train_years"],
-                    "val_years": config["data"]["val_years"],
-                    "test_years": config["data"]["test_years"],
-                },
-                f,
-                indent=2,
+        # Create data loaders
+        if world_size > 1 and not rank0_batch_broadcast:
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                seed=seed,
             )
-        logger.info(f"Data splits saved to: {split_path}")
+            val_sampler = DistributedSampler(
+                val_dataset, num_replicas=world_size, rank=rank, shuffle=False
+            )
+        else:
+            train_sampler = None
+            val_sampler = None
 
-    # Create data loaders
-    if world_size > 1:
-        train_sampler = DistributedSampler(
-            train_dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=seed
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config["training"]["batch_size"],
+            sampler=train_sampler,
+            shuffle=(train_sampler is None),
+            num_workers=config["data"].get("num_workers", 4),
+            pin_memory=True,
+            drop_last=True,
         )
-        val_sampler = DistributedSampler(
-            val_dataset, num_replicas=world_size, rank=rank, shuffle=False
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config["training"]["batch_size"],
+            sampler=val_sampler,
+            shuffle=False,
+            num_workers=config["data"].get("num_workers", 4),
+            pin_memory=True,
         )
+
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=config["training"]["batch_size"],
+            shuffle=False,
+            num_workers=config["data"].get("num_workers", 4),
+            pin_memory=True,
+        )
+
+        if rank == 0:
+            logger.info(f"Created data loaders:")
+            logger.info(f"  Train batches: {len(train_loader)}")
+            logger.info(f"  Val batches:   {len(val_loader)}")
+            logger.info(f"  Test batches:  {len(test_loader)}")
     else:
-        train_sampler = None
-        val_sampler = None
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config["training"]["batch_size"],
-        sampler=train_sampler,
-        shuffle=(train_sampler is None),
-        num_workers=config["data"].get("num_workers", 4),
-        pin_memory=True,
-        drop_last=True,
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config["training"]["batch_size"],
-        sampler=val_sampler,
-        shuffle=False,
-        num_workers=config["data"].get("num_workers", 4),
-        pin_memory=True,
-    )
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=config["training"]["batch_size"],
-        shuffle=False,
-        num_workers=config["data"].get("num_workers", 4),
-        pin_memory=True,
-    )
-
-    if rank == 0:
-        logger.info(f"Created data loaders:")
-        logger.info(f"  Train batches: {len(train_loader)}")
-        logger.info(f"  Val batches:   {len(val_loader)}")
-        logger.info(f"  Test batches:  {len(test_loader)}")
+        if rank == 0:
+            logger.info("Using rank0_batch_broadcast mode for distributed training")
 
     # =========================================================================
     # MODEL CREATION
@@ -495,6 +580,11 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
         encoder_type=config["model"]["encoder_type"],
         encoder_dim=config["model"]["encoder_dim"],
         encoder_blocks=config["model"]["encoder_blocks"],
+        vit_patch_size=config["model"].get("vit_patch_size", 7),
+        vit_num_heads=config["model"].get("vit_num_heads", 8),
+        vit_mlp_ratio=config["model"].get("vit_mlp_ratio", 4.0),
+        vit_dropout=config["model"].get("vit_dropout", 0.1),
+        vit_attention_dropout=config["model"].get("vit_attention_dropout", 0.1),
         decoder_hidden_dims=config["model"]["decoder_hidden_dims"],
         target_vars=config["model"]["target_vars"],
         use_film=config["model"]["use_film"],
@@ -515,7 +605,8 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
 
     # Wrap model with DDP if using multiple GPUs
     if world_size > 1:
-        model = DDP(model, device_ids=[rank], output_device=rank)
+        ddp_device_idx = rank if local_rank is None else local_rank
+        model = DDP(model, device_ids=[ddp_device_idx], output_device=ddp_device_idx)
         if rank == 0:
             logger.info(f"Model wrapped with DistributedDataParallel")
 
@@ -532,11 +623,14 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
         weighting_strategy=config["loss"]["weighting_strategy"],
         physics_weight=config["loss"].get("physics_weight", 0.1),
         use_physics=config["loss"].get("use_physics", False),
+        data_loss_types=config["loss"].get("data_loss_types", None),
+        tweedie_power=config["loss"].get("tweedie_power", 1.5),
+        tweedie_eps=config["loss"].get("tweedie_eps", 1e-6),
         use_clausius_clapeyron=config["loss"].get("use_clausius_clapeyron", False),
         use_temp_consistency=config["loss"].get("use_temp_consistency", False),
         use_humidity_bounds=config["loss"].get("use_humidity_bounds", False),
-        use_precip_non_negativity=config["loss"].get(
-            "use_precip_non_negativity", False
+        use_precip_nonnegativity=config["loss"].get(
+            "use_precip_nonnegativity", False
         ),
         use_spatial_smoothness=config["loss"].get("use_spatial_smoothness", False),
     ).to(device)
@@ -555,25 +649,38 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
 
     optimizer = optim.AdamW(
         model.parameters(),
-        lr=config["training"]["learning_rate"],
-        weight_decay=config["training"]["weight_decay"],
+        lr=config["optimizer"]["lr"],
+        weight_decay=config["optimizer"]["weight_decay"],
+        betas=tuple(config["optimizer"].get("betas", [0.9, 0.999])),
     )
 
-    if config["training"].get("use_scheduler", True):
+    scheduler = None
+    scheduler_type = config.get("scheduler", {}).get("type", "none")
+    if scheduler_type == "cosine":
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=config["training"]["epochs"],
-            eta_min=config["training"].get("min_lr", 1e-6),
+            T_max=config["training"]["max_epochs"],
+            eta_min=config.get("scheduler", {}).get("min_lr", 1e-6),
         )
-    else:
-        scheduler = None
+    elif scheduler_type == "plateau":
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            factor=config.get("scheduler", {}).get("factor", 0.5),
+            patience=config.get("scheduler", {}).get("patience", 5),
+        )
+    elif scheduler_type == "step":
+        scheduler = optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=config.get("scheduler", {}).get("step_size", 30),
+            gamma=config.get("scheduler", {}).get("gamma", 0.1),
+        )
 
     if rank == 0:
         logger.info(f"Optimizer: AdamW")
-        logger.info(f"  Learning rate: {config['training']['learning_rate']}")
-        logger.info(f"  Weight decay: {config['training']['weight_decay']}")
+        logger.info(f"  Learning rate: {config['optimizer']['lr']}")
+        logger.info(f"  Weight decay: {config['optimizer']['weight_decay']}")
         if scheduler:
-            logger.info(f"Scheduler: CosineAnnealingLR")
+            logger.info(f"Scheduler: {scheduler.__class__.__name__}")
 
     # =========================================================================
     # TRAINER
@@ -582,23 +689,24 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
-        criterion=criterion,
+        loss_fn=criterion,
         optimizer=optimizer,
         scheduler=scheduler,
         device=device,
-        target_vars=config["model"]["target_vars"],
+        max_epochs=config["training"]["max_epochs"],
+        stage1_epochs=config["training"]["stage1_epochs"],
+        gradient_clip_val=config["training"]["gradient_clip_val"],
+        early_stopping_patience=config["training"]["early_stopping_patience"],
+        save_every_n_epochs=config["training"]["save_every_n_epochs"],
+        use_amp=config["training"].get("use_amp", True),
+        log_interval=config.get("logging", {}).get("log_interval", 50),
+        val_interval=config["training"]["val_interval"],
         checkpoint_dir=exp_dir / "checkpoints",
-        log_dir=exp_dir / "logs",
         rank=rank,
         world_size=world_size,
+        is_distributed=world_size > 1,
+        use_rank0_batch_broadcast=rank0_batch_broadcast,
     )
-
-    # Resume from checkpoint if specified
-    start_epoch = 0
-    if resume_path:
-        start_epoch = trainer.load_checkpoint(resume_path)
-        if rank == 0:
-            logger.info(f"Resumed from epoch {start_epoch}")
 
     # =========================================================================
     # TRAINING
@@ -608,12 +716,7 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
         logger.info("STARTING TRAINING")
         logger.info("=" * 70)
 
-    trainer.train(
-        epochs=config["training"]["epochs"],
-        start_epoch=start_epoch,
-        save_every=config["training"].get("save_every", 10),
-        eval_every=config["training"].get("eval_every", 1),
-    )
+    trainer.train(resume_from=resume_path)
 
     # =========================================================================
     # EVALUATION
@@ -655,7 +758,8 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None):
         cleanup_distributed()
 
     # Close data loader
-    data_loader.close()
+    if data_loader is not None:
+        data_loader.close()
 
 
 if __name__ == "__main__":
@@ -676,16 +780,36 @@ if __name__ == "__main__":
     if not Path(args.config).exists():
         raise FileNotFoundError(f"Config file not found: {args.config}")
 
+    # torchrun path (WORLD_SIZE/RANK/LOCAL_RANK are set by launcher)
+    env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if env_world_size > 1:
+        env_rank = int(os.environ["RANK"])
+        env_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        main(
+            rank=env_rank,
+            world_size=env_world_size,
+            config_path=args.config,
+            resume_path=args.resume,
+            local_rank=env_local_rank,
+        )
+        sys.exit(0)
+
     # Single GPU or CPU training
     if args.gpus <= 1:
-        main(rank=0, world_size=1, config_path=args.config, resume_path=args.resume)
+        main(
+            rank=0,
+            world_size=1,
+            config_path=args.config,
+            resume_path=args.resume,
+            local_rank=0,
+        )
     # Multi-GPU training
     else:
         import torch.multiprocessing as mp
 
         mp.spawn(
             main,
-            args=(args.gpus, args.config, args.resume),
+            args=(args.gpus, args.config, args.resume, None),
             nprocs=args.gpus,
             join=True,
         )

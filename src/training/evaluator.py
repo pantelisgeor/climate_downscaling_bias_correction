@@ -79,23 +79,31 @@ class Evaluator:
         pbar = tqdm(self.test_loader, desc="Evaluating")
 
         for batch in pbar:
-            inputs, targets = batch
-            inputs = inputs.to(self.device)
-            targets = targets.to(self.device)
+            inputs, targets, metadata = batch
+            static, dynamic = inputs
+
+            static = static.to(self.device, non_blocking=True)
+            dynamic = dynamic.to(self.device, non_blocking=True)
+            lead_indices = metadata["lead"].to(self.device, non_blocking=True)
+
+            targets = {
+                var: target.to(self.device, non_blocking=True)
+                for var, target in targets.items()
+            }
 
             # Forward pass
-            predictions = self.model(inputs)
+            predictions = self.model(
+                static=static, dynamic=dynamic, lead_indices=lead_indices
+            )
 
             # Move to CPU and store
-            predictions = predictions.cpu().numpy()  # (batch, n_vars, H, W)
-            targets = targets.cpu().numpy()  # (batch, n_vars, H, W)
-
-            # Store predictions and targets for each variable
-            for i, var in enumerate(self.target_vars):
+            for var in self.target_vars:
                 all_predictions[var].append(
-                    predictions[:, i : i + 1, :, :]
-                )  # Keep channel dim
-                all_targets[var].append(targets[:, i : i + 1, :, :])
+                    predictions[var].detach().cpu().numpy()
+                )
+                all_targets[var].append(targets[var].detach().cpu().numpy())
+
+            all_metadata.append(lead_indices.detach().cpu().numpy())
 
         # Concatenate all batches
         logger.info("Computing metrics...")
@@ -105,40 +113,45 @@ class Evaluator:
             )  # (N, 1, H, W)
             all_targets[var] = np.concatenate(all_targets[var], axis=0)  # (N, 1, H, W)
 
-        # Denormalize predictions and targets
-        logger.info("Denormalizing predictions and targets...")
+        # Resolve base dataset/data loader
+        dataset = self.test_loader.dataset
+        if hasattr(dataset, "dataset"):
+            base_dataset = dataset.dataset
+        else:
+            base_dataset = dataset
+
+        data_loader = getattr(base_dataset, "data_loader", None)
+        use_denorm = (
+            getattr(base_dataset, "normalize", False)
+            and data_loader is not None
+            and hasattr(data_loader, "scalers")
+            and all(var in data_loader.scalers for var in self.target_vars)
+        )
+
+        # Denormalize predictions and targets when scalers are available.
+        logger.info(
+            "Denormalizing predictions and targets..."
+            if use_denorm
+            else "Skipping denormalization (no normalization/scalers available)..."
+        )
         all_predictions_denorm = {}
         all_targets_denorm = {}
 
         for var in self.target_vars:
-            # Get the dataset's data_loader for denormalization
-            dataset = self.test_loader.dataset
-            # Handle Subset wrapper
-            if hasattr(dataset, "dataset"):
-                base_dataset = dataset.dataset
-            else:
-                base_dataset = dataset
-
-            data_loader = base_dataset.data_loader
-
-            # Denormalize
             pred = all_predictions[var]  # (N, 1, H, W)
             target = all_targets[var]  # (N, 1, H, W)
 
-            # Flatten for denormalization
-            pred_flat = pred.reshape(-1)
-            target_flat = target.reshape(-1)
+            if use_denorm:
+                pred_flat = pred.reshape(-1)
+                target_flat = target.reshape(-1)
 
-            # Denormalize
-            pred_denorm = data_loader.denormalize(pred_flat, var)
-            target_denorm = data_loader.denormalize(target_flat, var)
-
-            # Note: denormalize() in data_loader.py now handles inverse log transform for tpERA
-            # So pred_denorm and target_denorm are already in original scale
-
-            # Reshape back
-            pred_denorm = pred_denorm.reshape(pred.shape)
-            target_denorm = target_denorm.reshape(target.shape)
+                pred_denorm = data_loader.denormalize(pred_flat, var).reshape(pred.shape)
+                target_denorm = data_loader.denormalize(target_flat, var).reshape(
+                    target.shape
+                )
+            else:
+                pred_denorm = pred
+                target_denorm = target
 
             all_predictions_denorm[var] = pred_denorm
             all_targets_denorm[var] = target_denorm
@@ -155,7 +168,15 @@ class Evaluator:
         metrics = self.compute_metrics(all_predictions_denorm, all_targets_denorm)
 
         # Compute per-lead metrics if metadata is available
-        per_lead_metrics = {}
+        if all_metadata:
+            lead_array = np.concatenate(all_metadata, axis=0)
+            per_lead_metrics = self.compute_per_lead_metrics(
+                all_predictions_denorm,
+                all_targets_denorm,
+                {"lead": lead_array},
+            )
+        else:
+            per_lead_metrics = {}
 
         # Save metrics
         metrics_path = self.results_dir / "test_metrics.json"

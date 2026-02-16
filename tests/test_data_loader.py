@@ -212,7 +212,7 @@ class TestDataAccess:
         inputs, targets = data_loader[0]
 
         # Check shapes
-        assert inputs.shape[0] == 10  # Number of input variables
+        assert inputs.shape[0] == 19  # 9 regular vars + 10 cci_agg classes
         assert targets.shape[0] == 4  # Number of target variables
         assert inputs.shape[1] == targets.shape[1]  # Same spatial points
 
@@ -228,15 +228,16 @@ class TestDataAccess:
         indices = np.random.choice(
             len(data_loader), min(n_samples, len(data_loader)), replace=False
         )
+        actual_samples = len(indices)
 
         start = time.time()
         for idx in indices:
             inputs, targets = data_loader[idx]
         elapsed = time.time() - start
 
-        samples_per_sec = n_samples / elapsed
+        samples_per_sec = actual_samples / elapsed
         print(f"\n⚡ Performance: {samples_per_sec:.0f} samples/second")
-        print(f"   ({elapsed*1000/n_samples:.2f} ms per sample)")
+        print(f"   ({elapsed*1000/actual_samples:.2f} ms per sample)")
 
         # In-memory should be very fast (>1000 samples/sec)
         assert samples_per_sec > 100, "In-memory access should be fast"

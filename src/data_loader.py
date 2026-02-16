@@ -63,6 +63,9 @@ class DecadalDataLoader:
             ValueError: If normalize_method is not 'minmax' or 'zscore'
             KeyError: If required variables or dimensions are missing from the dataset
         """
+        # Set early so __del__/close are safe even if initialization fails.
+        self._closed = True
+
         start_time = time.time()
         logger.info("=" * 70)
         logger.info("INITIALIZING DECADAL DATA LOADER")

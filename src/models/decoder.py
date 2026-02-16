@@ -115,15 +115,29 @@ class MultiDecoder(nn.Module):
         # Create independent decoder for each target
         self.decoders = nn.ModuleDict()
 
+        # for var in target_vars:
+        #     # Use ReLU for precipitation (non-negative)
+        #     if var == "tpERA":
+        #         activation = "relu"
+        #     elif var == "rhERA":
+        #         activation = "none"  # Will apply bounds in loss
+        #     else:
+        #         activation = "none"
+
+        #     self.decoders[var] = Decoder(
+        #         input_dim=input_dim,
+        #         hidden_dims=hidden_dims,
+        #         output_size=output_size,
+        #         output_activation=activation,
+        #     )
         for var in target_vars:
-            # Use ReLU for precipitation (non-negative)
             if var == "tpERA":
-                activation = "relu"
+                # Let the loss/physics enforce non-negativity; no hard ReLU here
+                activation = "none"
             elif var == "rhERA":
-                activation = "none"  # Will apply bounds in loss
+                activation = "none"
             else:
                 activation = "none"
-
             self.decoders[var] = Decoder(
                 input_dim=input_dim,
                 hidden_dims=hidden_dims,

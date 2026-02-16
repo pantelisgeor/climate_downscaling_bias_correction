@@ -22,7 +22,7 @@ class ClimateDataset(Dataset):
         self,
         data_loader,  # DecadalDataLoader instance
         normalize: bool = True,
-        fit_normalizer: bool = False,
+        image_size: Tuple[int, int] = (35, 77),
         target_vars: list = ["tasERA", "tasmaxERA", "tpERA", "rhERA"],
     ):
         """
@@ -31,11 +31,11 @@ class ClimateDataset(Dataset):
         Args:
             data_loader: DecadalDataLoader instance
             normalize: Whether to normalize data
-            fit_normalizer: Whether to fit normalizer (only for training set)
             target_vars: List of target variable names
         """
         self.data_loader = data_loader
         self.normalize = normalize
+        self.image_size = tuple(image_size)
         self.target_vars = target_vars
 
         # Input structure from data_loader:
@@ -82,7 +82,7 @@ class ClimateDataset(Dataset):
         metadata = self.data_loader.get_combination_info(idx)
 
         # Reshape from [19, H*W] to [19, H, W]
-        H, W = 35, 77
+        H, W = self.image_size
         inputs = inputs.reshape(inputs.shape[0], H, W)  # [19, H, W]
 
         # Split static and dynamic features

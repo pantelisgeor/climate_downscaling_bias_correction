@@ -5,6 +5,7 @@ Trainer for ClimateNet with two-stage training strategy.
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 from pathlib import Path
@@ -52,6 +53,7 @@ class Trainer:
         rank: int = 0,
         world_size: int = 1,
         is_distributed: bool = False,
+        use_rank0_batch_broadcast: bool = False,
     ):
         """
         Initialize trainer.
@@ -116,6 +118,7 @@ class Trainer:
         self.rank = rank
         self.world_size = world_size
         self.is_distributed = is_distributed
+        self.use_rank0_batch_broadcast = use_rank0_batch_broadcast
 
         # Move model to device
         self.model = self.model.to(self.device)
@@ -127,10 +130,52 @@ class Trainer:
         logger.info(f"Mixed Precision: {self.use_amp}")
         logger.info(f"Max Epochs: {self.max_epochs}")
         logger.info(f"Stage 1 Epochs: {self.stage1_epochs}")
-        logger.info(f"Training samples: {len(train_loader.dataset):,}")
-        logger.info(f"Validation samples: {len(val_loader.dataset):,}")
-        logger.info(f"Batch size: {train_loader.batch_size}")
+        if self.train_loader is not None and hasattr(self.train_loader, "dataset"):
+            logger.info(f"Training samples: {len(train_loader.dataset):,}")
+        else:
+            logger.info("Training samples: provided by rank-0 batch broadcast")
+        if self.val_loader is not None and hasattr(self.val_loader, "dataset"):
+            logger.info(f"Validation samples: {len(val_loader.dataset):,}")
+        else:
+            logger.info("Validation samples: provided by rank-0 validation broadcast")
+        if self.train_loader is not None and hasattr(self.train_loader, "batch_size"):
+            logger.info(f"Batch size: {train_loader.batch_size}")
         logger.info("=" * 70)
+
+    def _broadcast_batch_payload(
+        self, inputs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor], lead_indices: torch.Tensor
+    ):
+        payload = {
+            "stop": False,
+            "static": inputs["static"].detach().cpu(),
+            "dynamic": inputs["dynamic"].detach().cpu(),
+            "lead": lead_indices.detach().cpu(),
+            "targets": {k: v.detach().cpu() for k, v in targets.items()},
+        }
+        obj = [payload]
+        dist.broadcast_object_list(obj, src=0)
+
+    def _broadcast_stop_payload(self):
+        obj = [{"stop": True}]
+        dist.broadcast_object_list(obj, src=0)
+
+    def _receive_batch_payload(self):
+        obj = [None]
+        dist.broadcast_object_list(obj, src=0)
+        payload = obj[0]
+        if payload.get("stop", False):
+            return None, None, None, True
+
+        inputs = {
+            "static": payload["static"].to(self.device, non_blocking=True),
+            "dynamic": payload["dynamic"].to(self.device, non_blocking=True),
+        }
+        lead_indices = payload["lead"].to(self.device, non_blocking=True)
+        targets = {
+            var: tensor.to(self.device, non_blocking=True)
+            for var, tensor in payload["targets"].items()
+        }
+        return inputs, targets, lead_indices, False
 
     def _prepare_batch(self, batch: Tuple) -> Tuple[Dict, Dict, torch.Tensor]:
         """
@@ -165,6 +210,20 @@ class Trainer:
 
         return inputs_dict, targets, lead_indices
 
+    def _distributed_mean(self, values: List[float]) -> float:
+        """Compute mean value across all ranks using sum/count reduction."""
+        local_sum = float(np.sum(values)) if values else 0.0
+        local_count = float(len(values))
+
+        if self.is_distributed and dist.is_available() and dist.is_initialized():
+            tensor = torch.tensor([local_sum, local_count], device=self.device)
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            global_sum = tensor[0].item()
+            global_count = tensor[1].item()
+            return global_sum / max(global_count, 1.0)
+
+        return local_sum / max(local_count, 1.0)
+
     def train_epoch(self, epoch: int, stage: int = 1) -> Dict[str, float]:
         """
         Train for one epoch.
@@ -178,8 +237,13 @@ class Trainer:
         """
         self.model.train()
 
-        # Set epoch for distributed sampler
-        if self.is_distributed and hasattr(self.train_loader.sampler, 'set_epoch'):
+        # Set epoch for distributed sampler (only when local train_loader exists).
+        if (
+            self.is_distributed
+            and self.train_loader is not None
+            and hasattr(self.train_loader, "sampler")
+            and hasattr(self.train_loader.sampler, "set_epoch")
+        ):
             self.train_loader.sampler.set_epoch(epoch)
 
         # Disable physics losses in stage 1
@@ -193,90 +257,150 @@ class Trainer:
             "physics": [],
         }
 
-        # Progress bar
-        pbar = tqdm(
-            self.train_loader,
-            desc=f"Stage {stage} - Epoch {epoch}/{self.max_epochs}",
-            leave=False,
+        use_server_mode = (
+            self.is_distributed
+            and self.use_rank0_batch_broadcast
+            and dist.is_available()
+            and dist.is_initialized()
         )
 
-        for batch_idx, batch in enumerate(pbar):
-            # Prepare batch
-            inputs, targets, lead_indices = self._prepare_batch(batch)
+        if use_server_mode and self.rank != 0:
+            pbar = None
+            batch_idx = 0
+            while True:
+                inputs, targets, lead_indices, should_stop = self._receive_batch_payload()
+                if should_stop:
+                    break
 
-            # Forward pass with mixed precision
-            with autocast("cuda", enabled=self.use_amp):
-                # Model forward
-                predictions = self.model(
-                    static=inputs["static"],
-                    dynamic=inputs["dynamic"],
-                    lead_indices=lead_indices,
-                )
-
-                # Compute loss
-                loss_dict = self.loss_fn(
-                    predictions=predictions, targets=targets, return_components=True
-                )
-
-                total_loss = loss_dict["total"]
-
-            # Backward pass
-            self.optimizer.zero_grad()
-
-            if self.use_amp:
-                self.scaler.scale(total_loss).backward()
-
-                # Gradient clipping
-                if self.gradient_clip_val > 0:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.gradient_clip_val
+                # Forward pass with mixed precision
+                with autocast("cuda", enabled=self.use_amp):
+                    predictions = self.model(
+                        static=inputs["static"],
+                        dynamic=inputs["dynamic"],
+                        lead_indices=lead_indices,
                     )
 
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                total_loss.backward()
-
-                # Gradient clipping
-                if self.gradient_clip_val > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.gradient_clip_val
+                    loss_dict = self.loss_fn(
+                        predictions=predictions, targets=targets, return_components=True
                     )
 
-                self.optimizer.step()
+                    total_loss = loss_dict["total"]
 
-            # Update global step
-            self.global_step += 1
+                self.optimizer.zero_grad()
 
-            # Log losses
-            epoch_losses["total"].append(total_loss.item())
-            epoch_losses["data"].append(loss_dict["total_data"].item())
+                if self.use_amp:
+                    self.scaler.scale(total_loss).backward()
+                    if self.gradient_clip_val > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.gradient_clip_val
+                        )
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    total_loss.backward()
+                    if self.gradient_clip_val > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.gradient_clip_val
+                        )
+                    self.optimizer.step()
 
-            if isinstance(loss_dict["total_physics"], torch.Tensor):
-                epoch_losses["physics"].append(loss_dict["total_physics"].item())
-            else:
-                epoch_losses["physics"].append(loss_dict["total_physics"])
+                self.global_step += 1
+                epoch_losses["total"].append(total_loss.item())
+                epoch_losses["data"].append(loss_dict["total_data"].item())
+                if isinstance(loss_dict["total_physics"], torch.Tensor):
+                    epoch_losses["physics"].append(loss_dict["total_physics"].item())
+                else:
+                    epoch_losses["physics"].append(loss_dict["total_physics"])
+                batch_idx += 1
+        else:
+            # Progress bar
+            pbar = tqdm(
+                self.train_loader,
+                desc=f"Stage {stage} - Epoch {epoch}/{self.max_epochs}",
+                leave=False,
+            )
 
-            # Update progress bar
-            if batch_idx % self.log_interval == 0:
-                pbar.set_postfix(
-                    {
-                        "loss": f"{total_loss.item():.4f}",
-                        "data": f"{loss_dict['total_data'].item():.4f}",
-                        "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
-                    }
-                )
+            for batch_idx, batch in enumerate(pbar):
+                # Prepare batch
+                inputs, targets, lead_indices = self._prepare_batch(batch)
+
+                if use_server_mode and self.rank == 0:
+                    self._broadcast_batch_payload(inputs, targets, lead_indices)
+
+                # Forward pass with mixed precision
+                with autocast("cuda", enabled=self.use_amp):
+                    # Model forward
+                    predictions = self.model(
+                        static=inputs["static"],
+                        dynamic=inputs["dynamic"],
+                        lead_indices=lead_indices,
+                    )
+
+                    # Compute loss
+                    loss_dict = self.loss_fn(
+                        predictions=predictions, targets=targets, return_components=True
+                    )
+
+                    total_loss = loss_dict["total"]
+
+                # Backward pass
+                self.optimizer.zero_grad()
+
+                if self.use_amp:
+                    self.scaler.scale(total_loss).backward()
+
+                    # Gradient clipping
+                    if self.gradient_clip_val > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.gradient_clip_val
+                        )
+
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    total_loss.backward()
+
+                    # Gradient clipping
+                    if self.gradient_clip_val > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.gradient_clip_val
+                        )
+
+                    self.optimizer.step()
+
+                # Update global step
+                self.global_step += 1
+
+                # Log losses
+                epoch_losses["total"].append(total_loss.item())
+                epoch_losses["data"].append(loss_dict["total_data"].item())
+
+                if isinstance(loss_dict["total_physics"], torch.Tensor):
+                    epoch_losses["physics"].append(loss_dict["total_physics"].item())
+                else:
+                    epoch_losses["physics"].append(loss_dict["total_physics"])
+
+                # Update progress bar
+                if batch_idx % self.log_interval == 0:
+                    pbar.set_postfix(
+                        {
+                            "loss": f"{total_loss.item():.4f}",
+                            "data": f"{loss_dict['total_data'].item():.4f}",
+                            "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                        }
+                    )
+
+            if use_server_mode and self.rank == 0:
+                self._broadcast_stop_payload()
 
         # Restore physics losses if in stage 1
         if stage == 1 and hasattr(self.loss_fn, "use_physics"):
             self.loss_fn.use_physics = original_use_physics
 
         # Compute average losses
-        avg_losses = {
-            key: np.mean(values) if values else 0.0
-            for key, values in epoch_losses.items()
-        }
+        avg_losses = {key: self._distributed_mean(values) for key, values in epoch_losses.items()}
 
         return avg_losses
 
@@ -292,6 +416,18 @@ class Trainer:
             Dictionary of average validation losses
         """
         self.model.eval()
+
+        use_server_mode = (
+            self.is_distributed
+            and self.use_rank0_batch_broadcast
+            and dist.is_available()
+            and dist.is_initialized()
+        )
+
+        if use_server_mode and self.rank != 0:
+            obj = [None]
+            dist.broadcast_object_list(obj, src=0)
+            return obj[0]
 
         val_losses = {
             "total": [],
@@ -335,15 +471,16 @@ class Trainer:
                     var_losses[var].append(loss_dict["data_losses"][var].item())
 
         # Compute averages
-        avg_losses = {
-            key: np.mean(values) if values else 0.0
-            for key, values in val_losses.items()
-        }
+        avg_losses = {key: self._distributed_mean(values) for key, values in val_losses.items()}
 
         # Add per-variable losses
         for var in self.loss_fn.target_vars:
             if var_losses[var]:
-                avg_losses[f"{var}_loss"] = np.mean(var_losses[var])
+                avg_losses[f"{var}_loss"] = self._distributed_mean(var_losses[var])
+
+        if use_server_mode and self.rank == 0:
+            obj = [avg_losses]
+            dist.broadcast_object_list(obj, src=0)
 
         return avg_losses
 

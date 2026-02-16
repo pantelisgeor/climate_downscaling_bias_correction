@@ -138,6 +138,57 @@ class QuantileLoss(nn.Module):
         return loss.mean()
 
 
+class TweedieDevianceLoss(nn.Module):
+    """
+    Tweedie deviance loss for compound Poisson-Gamma targets (1 < p < 2).
+
+    Suitable for precipitation-like variables with a point mass at zero and
+    continuous positive tail.
+    """
+
+    def __init__(self, power: float = 1.5, eps: float = 1e-6):
+        super().__init__()
+        if not (1.0 < power < 2.0):
+            raise ValueError(f"Tweedie power must satisfy 1 < p < 2, got {power}")
+        self.power = float(power)
+        self.eps = float(eps)
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute Tweedie deviance:
+            D(y, mu) = 2 * [ y^(2-p)/((1-p)(2-p)) - y*mu^(1-p)/(1-p) + mu^(2-p)/(2-p) ]
+
+        Args:
+            pred: Mean predictions mu [batch, 1, H, W]
+            target: Targets y [batch, 1, H, W]
+            mask: Optional mask [batch, 1, H, W]
+
+        Returns:
+            Scalar loss
+        """
+        p = self.power
+
+        # mu must be strictly positive because exponent 1-p is negative.
+        mu = torch.clamp(pred, min=self.eps)
+        y = torch.clamp(target, min=0.0)
+
+        term1 = torch.pow(y, 2.0 - p) / ((1.0 - p) * (2.0 - p))
+        term2 = y * torch.pow(mu, 1.0 - p) / (1.0 - p)
+        term3 = torch.pow(mu, 2.0 - p) / (2.0 - p)
+        loss = 2.0 * (term1 - term2 + term3)
+
+        if mask is not None:
+            loss = loss * mask
+            return loss.sum() / (mask.sum() + 1e-8)
+
+        return loss.mean()
+
+
 class MultiVariableDataLoss(nn.Module):
     """
     Combined data loss for all target variables.
@@ -147,6 +198,8 @@ class MultiVariableDataLoss(nn.Module):
         self,
         target_vars: list = ["tasERA", "tasmaxERA", "tpERA", "rhERA"],
         loss_types: Dict[str, str] = None,
+        tweedie_power: float = 1.5,
+        tweedie_eps: float = 1e-6,
     ):
         """
         Initialize multi-variable data loss.
@@ -154,7 +207,9 @@ class MultiVariableDataLoss(nn.Module):
         Args:
             target_vars: List of target variable names
             loss_types: Dictionary mapping variable names to loss types
-                       Options: 'mse', 'mae', 'hybrid'
+                       Options: 'mse', 'mae', 'hybrid', 'tweedie'
+            tweedie_power: Tweedie power parameter p for tweedie loss (1<p<2)
+            tweedie_eps: Minimum clamp for prediction mean mu in tweedie loss
         """
         super().__init__()
 
@@ -180,6 +235,10 @@ class MultiVariableDataLoss(nn.Module):
                 self.loss_functions[var] = MAELoss()
             elif loss_type == "hybrid":
                 self.loss_functions[var] = HybridLoss(alpha=0.7)
+            elif loss_type == "tweedie":
+                self.loss_functions[var] = TweedieDevianceLoss(
+                    power=tweedie_power, eps=tweedie_eps
+                )
             else:
                 raise ValueError(f"Unknown loss type: {loss_type}")
 

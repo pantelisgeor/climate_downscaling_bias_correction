@@ -49,6 +49,13 @@ model:
 # Loss function
 loss:
   weighting_strategy: equal
+  data_loss_types:
+    tasERA: mse
+    tasmaxERA: mse
+    tpERA: tweedie
+    rhERA: mse
+  tweedie_power: 1.6
+  tweedie_eps: 1.0e-6
   physics_weight: 0.02      # ↓ from 0.1
   use_physics: true
   use_clausius_clapeyron: true
@@ -79,7 +86,7 @@ scheduler:
 
 # Training configuration
 training:
-  batch_size: 230
+  batch_size: 225
   max_epochs: 100
   stage1_epochs: 50  # Data loss only
   gradient_clip_val: 1.0

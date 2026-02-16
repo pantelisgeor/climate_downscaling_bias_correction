@@ -56,10 +56,11 @@ training:
 
 # Data configuration
 data:
-  nc_path: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models/preprocessed_data/decadal_for_training/full_dataset.nc"
+  nc_path: "/nvme/h/pgeorgiades/scratch/full_dataset.nc"
   cache_dir: "./cache"
   load_in_memory: true
   normalize: true
+  normalize_samples: 40000
   normalize_method: "minmax"  # "minmax" or "zscore"
   
   # Year-based splits

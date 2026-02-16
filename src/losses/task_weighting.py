@@ -306,6 +306,9 @@ class CombinedLoss(nn.Module):
         weighting_strategy: str = "uncertainty",  # 'uncertainty', 'dwa', 'gradnorm', 'equal'
         physics_weight: float = 0.1,
         use_physics: bool = True,
+        data_loss_types: Optional[Dict[str, str]] = None,
+        tweedie_power: float = 1.5,
+        tweedie_eps: float = 1e-6,
         **kwargs,
     ):
         """
@@ -316,6 +319,9 @@ class CombinedLoss(nn.Module):
             weighting_strategy: Task weighting strategy
             physics_weight: Weight for physics loss relative to data loss
             use_physics: Whether to use physics-informed losses
+            data_loss_types: Per-target data loss function selection
+            tweedie_power: Tweedie p parameter for tweedie data loss
+            tweedie_eps: Clamp epsilon for tweedie prediction mean
             **kwargs: Additional arguments for weighting strategy
         """
         super().__init__()
@@ -328,7 +334,12 @@ class CombinedLoss(nn.Module):
         self.use_physics = use_physics
 
         # Data loss
-        self.data_loss = MultiVariableDataLoss(target_vars=target_vars)
+        self.data_loss = MultiVariableDataLoss(
+            target_vars=target_vars,
+            loss_types=data_loss_types,
+            tweedie_power=tweedie_power,
+            tweedie_eps=tweedie_eps,
+        )
 
         # Physics loss
         if use_physics:
