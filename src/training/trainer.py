@@ -547,10 +547,29 @@ class Trainer:
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
         logger.info(f"Loading checkpoint: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
-        # Load model state
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        # Load model state (handle DDP/non-DDP key prefix mismatch)
+        checkpoint_state_dict = checkpoint["model_state_dict"]
+        model_state_keys = list(self.model.state_dict().keys())
+        checkpoint_keys = list(checkpoint_state_dict.keys())
+
+        if model_state_keys and checkpoint_keys:
+            model_uses_module_prefix = model_state_keys[0].startswith("module.")
+            checkpoint_uses_module_prefix = checkpoint_keys[0].startswith("module.")
+
+            if checkpoint_uses_module_prefix and not model_uses_module_prefix:
+                checkpoint_state_dict = {
+                    key.replace("module.", "", 1): value
+                    for key, value in checkpoint_state_dict.items()
+                }
+            elif not checkpoint_uses_module_prefix and model_uses_module_prefix:
+                checkpoint_state_dict = {
+                    f"module.{key}": value
+                    for key, value in checkpoint_state_dict.items()
+                }
+
+        self.model.load_state_dict(checkpoint_state_dict)
 
         # Load optimizer state
         if load_optimizer and "optimizer_state_dict" in checkpoint:

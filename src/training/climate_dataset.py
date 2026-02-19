@@ -38,6 +38,16 @@ class ClimateDataset(Dataset):
         self.image_size = tuple(image_size)
         self.target_vars = target_vars
 
+        # If normalization requested, data_loader must provide `scalers` dict
+        if self.normalize:
+            if not hasattr(self.data_loader, "scalers") or not isinstance(
+                getattr(self.data_loader, "scalers", None), dict
+            ):
+                raise ValueError(
+                    "Normalization requested but `data_loader.scalers` is missing or not a dict. "
+                    "Ensure scalers are fitted/assigned before creating ClimateDataset."
+                )
+
         # Input structure from data_loader:
         # 0: pr, 1: tas, 2: tasmax, 3: hurs, 4: dem, 5: rho, 6: phi,
         # 7: sin_time, 8: cos_time, 9-18: cci_agg (10 classes)

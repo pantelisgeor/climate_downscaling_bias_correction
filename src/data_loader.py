@@ -182,7 +182,9 @@ class DecadalDataLoader:
         if "pr" in self.ds.data_vars:
             try:
                 self.ds["pr"] = self.ds["pr"] / 1000.0
-                print(f"input: {self.ds['pr'].mean().item():.4f} - output: {self.ds['tpERA'].mean().item():.4f}")
+                print(
+                    f"input: {self.ds['pr'].mean().item():.5f} - output: {self.ds['tpERA'].mean().item():.5f}"
+                )
                 try:
                     self.ds["pr"].attrs["units"] = "mm"
                 except Exception:

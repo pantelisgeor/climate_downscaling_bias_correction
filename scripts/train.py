@@ -31,6 +31,34 @@ from src.training.trainer import Trainer
 from src.training.evaluator import Evaluator
 
 
+def load_state_dict_flexible(model: nn.Module, state_dict: dict) -> None:
+    """
+    Load a checkpoint state_dict while handling DDP/non-DDP key prefix differences.
+
+    Supports both key styles:
+    - with "module." prefix (DDP-wrapped state dict)
+    - without "module." prefix (plain module state dict)
+    """
+    if not state_dict:
+        raise ValueError("Empty state_dict provided")
+
+    model_state_keys = list(model.state_dict().keys())
+    checkpoint_keys = list(state_dict.keys())
+
+    model_uses_module_prefix = model_state_keys[0].startswith("module.")
+    checkpoint_uses_module_prefix = checkpoint_keys[0].startswith("module.")
+
+    adjusted_state_dict = state_dict
+    if checkpoint_uses_module_prefix and not model_uses_module_prefix:
+        adjusted_state_dict = {
+            key.replace("module.", "", 1): value for key, value in state_dict.items()
+        }
+    elif not checkpoint_uses_module_prefix and model_uses_module_prefix:
+        adjusted_state_dict = {f"module.{key}": value for key, value in state_dict.items()}
+
+    model.load_state_dict(adjusted_state_dict)
+
+
 def setup_logger(
     log_dir: Path, rank: int = 0, log_level: str = "INFO"
 ) -> logging.Logger:
@@ -106,11 +134,17 @@ def create_experiment_directory(
 
             return exp_dir
 
-        base_dir = Path(config["experiment"]["base_dir"])
-        experiment_name = config["experiment"]["name"]
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        experiment_cfg = config["experiment"]
+        configured_output_dir = experiment_cfg.get("output_dir")
 
-        exp_dir = base_dir / f"{experiment_name}_{timestamp}"
+        if configured_output_dir:
+            exp_dir = Path(configured_output_dir)
+        else:
+            base_dir = Path(experiment_cfg["base_dir"])
+            experiment_name = experiment_cfg["name"]
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            exp_dir = base_dir / f"{experiment_name}_{timestamp}"
+
         exp_dir.mkdir(parents=True, exist_ok=True)
         (exp_dir / "checkpoints").mkdir(exist_ok=True)
         (exp_dir / "logs").mkdir(exist_ok=True)
@@ -273,6 +307,24 @@ def main(
     seed = config.get("seed", 42)
     torch.manual_seed(seed + rank)
     np.random.seed(seed + rank)
+    import random
+    random.seed(seed + rank)
+    # If CUDA is available, set CUDA seeds and deterministic flags
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed + rank)
+        torch.cuda.manual_seed_all(seed + rank)
+
+    # Control cudnn determinism (configurable)
+    cudnn_cfg = config.get("training", {}).get("cudnn", {})
+    # Expected keys: 'deterministic' (bool), 'benchmark' (bool)
+    deterministic = cudnn_cfg.get("deterministic", True)
+    benchmark = cudnn_cfg.get("benchmark", False)
+    try:
+        torch.backends.cudnn.deterministic = bool(deterministic)
+        torch.backends.cudnn.benchmark = bool(benchmark)
+    except Exception:
+        # Older/newer PyTorch may not allow changes; ignore safely
+        pass
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed + rank)
 
@@ -730,11 +782,10 @@ def main(
         best_model_path = exp_dir / "checkpoints" / "best_model.pt"
         if best_model_path.exists():
             logger.info(f"Loading best model from: {best_model_path}")
-            checkpoint = torch.load(best_model_path, map_location=device)
-            if world_size > 1:
-                model.module.load_state_dict(checkpoint["model_state_dict"])
-            else:
-                model.load_state_dict(checkpoint["model_state_dict"])
+            checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
+            checkpoint_state_dict = checkpoint.get("model_state_dict", checkpoint)
+            target_model = model.module if world_size > 1 else model
+            load_state_dict_flexible(target_model, checkpoint_state_dict)
 
         evaluator = Evaluator(
             model=model.module if world_size > 1 else model,

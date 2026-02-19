@@ -371,13 +371,34 @@ class VisionTransformerEncoder(nn.Module):
         w = self.patch_embed.projection.weight.data
         nn.init.trunc_normal_(w, std=0.02)
 
-        # Initialize transformer blocks
+        # Initialize transformer blocks (robust to PyTorch MultiheadAttention internals)
         for block in self.blocks:
-            # Initialize attention weights
-            nn.init.xavier_uniform_(block.attn.in_proj_weight)
-            nn.init.xavier_uniform_(block.attn.out_proj.weight)
-            nn.init.zeros_(block.attn.in_proj_bias)
-            nn.init.zeros_(block.attn.out_proj.bias)
+            attn = block.attn
+            try:
+                # Prefer initializing fused in_proj_* if present
+                if hasattr(attn, "in_proj_weight"):
+                    nn.init.xavier_uniform_(attn.in_proj_weight)
+                else:
+                    # Handle implementations that expose separate q/k/v proj weights
+                    if hasattr(attn, "q_proj_weight"):
+                        nn.init.xavier_uniform_(attn.q_proj_weight)
+                    if hasattr(attn, "k_proj_weight"):
+                        nn.init.xavier_uniform_(attn.k_proj_weight)
+                    if hasattr(attn, "v_proj_weight"):
+                        nn.init.xavier_uniform_(attn.v_proj_weight)
+
+                # Biases if present
+                if hasattr(attn, "in_proj_bias"):
+                    nn.init.zeros_(attn.in_proj_bias)
+
+                # out_proj is typically a Linear module
+                if hasattr(attn, "out_proj") and hasattr(attn.out_proj, "weight"):
+                    nn.init.xavier_uniform_(attn.out_proj.weight)
+                if hasattr(attn, "out_proj") and hasattr(attn.out_proj, "bias"):
+                    nn.init.zeros_(attn.out_proj.bias)
+            except Exception:
+                # If any attribute layout differs across PyTorch versions, skip attention init safely
+                pass
 
             # Initialize MLP weights
             for module in block.mlp.modules():
