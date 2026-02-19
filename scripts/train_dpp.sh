@@ -1,4 +1,17 @@
 #!/bin/bash
+#SBATCH --job-name=climate-train
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
+#SBATCH --time=24:00:00
+#SBATCH --nodes=1
+#SBATCH -A p236
+#SBATCH --ntasks-per-node=20
+#SBATCH --gres=gpu:4
+#SBATCH --mem=185G
+#SBATCH -p gpu
+
+source ~/miniconda3/bin/activate conda_env
+cd /nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/code
 
 set -euo pipefail
 
@@ -16,6 +29,35 @@ fi
 
 if [[ ! -f "$CONFIG_PATH" ]]; then
     echo "ERROR: Config file not found: $CONFIG_PATH"
+    exit 1
+fi
+
+# Read experiment metadata and test years from config.
+readarray -t CONFIG_META < <(python - "$CONFIG_PATH" <<'PY'
+import sys
+import yaml
+
+cfg_path = sys.argv[1]
+with open(cfg_path, "r") as f:
+    cfg = yaml.safe_load(f)
+
+base_dir = cfg["experiment"]["base_dir"]
+name = cfg["experiment"]["name"]
+test_years = cfg.get("data", {}).get("test_years", [])
+years_csv = ",".join(str(y) for y in test_years)
+
+print(base_dir)
+print(name)
+print(years_csv)
+PY
+)
+
+EXPERIMENT_BASE_DIR="${CONFIG_META[0]}"
+EXPERIMENT_NAME="${CONFIG_META[1]}"
+TEST_YEARS_CSV="${CONFIG_META[2]}"
+
+if [[ -z "$TEST_YEARS_CSV" ]]; then
+    echo "ERROR: Could not resolve data.test_years from config: $CONFIG_PATH"
     exit 1
 fi
 
@@ -74,3 +116,25 @@ torchrun \
     --master_port=29500 \
     scripts/train.py \
     --config "$CONFIG_PATH"
+
+# Resolve latest experiment directory for this run.
+LATEST_EXPERIMENT_DIR=$(ls -dt "$EXPERIMENT_BASE_DIR"/"${EXPERIMENT_NAME}"_* 2>/dev/null | head -n 1 || true)
+if [[ -z "$LATEST_EXPERIMENT_DIR" ]]; then
+        echo "ERROR: Could not find experiment directory under $EXPERIMENT_BASE_DIR for name $EXPERIMENT_NAME"
+        exit 1
+fi
+
+INFER_DIR="$LATEST_EXPERIMENT_DIR/inferred"
+ANALYSIS_DIR="$LATEST_EXPERIMENT_DIR/analysis"
+
+echo "Running inference into: $INFER_DIR"
+python scripts/infer.py \
+    --experiment-dir "$LATEST_EXPERIMENT_DIR" \
+    --checkpoint best \
+    --years "$TEST_YEARS_CSV" \
+    --output-dir "$INFER_DIR"
+
+echo "Running analysis into: $ANALYSIS_DIR"
+python scripts/analyze_inference_outputs.py \
+    --input-dir "$INFER_DIR" \
+    --output-dir "$ANALYSIS_DIR"

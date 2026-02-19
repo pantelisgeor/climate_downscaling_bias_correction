@@ -1,0 +1,203 @@
+% Auto-generated documentation for the AI downscaling / bias correction codebase
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{hyperref}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{longtable}
+\usepackage{listings}
+\usepackage{color}
+\usepackage{float}
+\usepackage{booktabs}
+
+
+\title{ClimateNet -- Documentation and Developer Guide}
+\author{AI Downscale Project}
+\date{\today}
+
+\begin{document}
+	\maketitle
+	\tableofcontents
+	\vfill\pagebreak
+	
+	\section{Abstract}
+	This document describes the code, models, loss functions, training and inference procedures used for bias-correcting decadal climate prediction data. It is intended for researchers and engineers who want to run, inspect, or extend the project contained in this repository.
+	
+	\section{Repository layout}
+	The key files and directories (relative to the \texttt{code} directory) are:
+	\begin{itemize}
+		\item \texttt{configs/} -- experiment configuration YAML files (e.g., \texttt{configs/default\_4.yml}).
+		\item \texttt{src/data\_loader.py} -- dataset and loader: \texttt{DecadalDataLoader}.
+		\item \texttt{src/models/} -- model implementations: \texttt{climate\_net.py}, \texttt{encoder.py}, \texttt{decoder.py}, \texttt{film\_layer.py}.
+		\item \texttt{src/losses/} -- data-driven and physics-informed losses (e.g., \texttt{data\_losses.py}, \texttt{physics\_losses.py}).
+		\item \texttt{src/training/trainer.py} -- training loop and checkpointing logic (two-stage training).
+		\item \texttt{scripts/} -- convenience scripts for training and inference (\texttt{train.py}, \texttt{infer.py}, \texttt{analyze\_inference\_outputs.py}).
+		\item \texttt{configs/default\_4.yml} -- common configuration used by experiments (hyper-parameters, losses, data paths).
+	\end{itemize}
+	
+	\section{Getting started}
+	\subsection{Requirements}
+	The codebase uses Python 3.8+ with the usual scientific stack. Typical packages include: \texttt{torch>=1.8}, \texttt{xarray}, \texttt{numpy}, \texttt{pandas}, and \texttt{tqdm}. Use the project's Conda environment if provided or create a fresh environment.
+	
+	Example install (with conda/pip):
+	\begin{verbatim}
+		conda create -n climate python=3.9 -y
+		conda activate climate
+		pip install -r requirements.txt   # if provided
+		# or install core packages manually
+		pip install torch xarray numpy pandas tqdm matplotlib
+	\end{verbatim}
+	
+	\subsection{Quick start commands}
+	Train from a config (example):
+	\begin{verbatim}
+		python scripts/train.py --config configs/default_4.yml
+	\end{verbatim}
+	
+	Run inference with a trained checkpoint:
+	\begin{verbatim}
+		python scripts/infer.py --checkpoint experiments/.../best_model.pt --config configs/default_4.yml
+	\end{verbatim}
+	
+	\section{Data pipeline}
+	The main data handler is \texttt{DecadalDataLoader} implemented in \texttt{src/data\_loader.py}. Key responsibilities:
+	\begin{itemize}
+		\item Open and validate the netCDF dataset (expects dimensions \texttt{run, lead, time, latitude, longitude}).
+		\item Compute and cache valid (run, lead, time) combinations where inputs and targets contain no NaNs (fast when loaded in-memory).
+		\item Provide normalized input and target arrays and handle variable-specific transforms (e.g., log1p for precipitation: \texttt{tpERA}).
+		\item Expose helper methods: normalization/denormalization, index lookups, summary statistics and memory usage.
+	\end{itemize}
+	
+	Normalization modes available (see \texttt{configs/default\_4.yml}):
+	\begin{itemize}
+		\item \texttt{minmax}: scales to \([0,1]\) per variable.
+		\item \texttt{zscore}: standardize to zero mean and unit variance.
+	\end{itemize}
+	
+	The loader also flattens spatial grids for efficient numpy-based access and exposes data as channel-first arrays suitable for the model input.
+	
+	\section{Model architectures}
+	The primary model is a Single-Encoder Multi-Decoder architecture ("1EMD") implemented in \texttt{src/models/climate\_net.py} as the \texttt{ClimateNet} class. Two encoder options are provided:
+	\begin{enumerate}
+		\item CNN-based shared encoder: \texttt{CNNEncoder} (\texttt{src/models/encoder.py})
+		\item Vision-Transformer encoder: \texttt{VisionTransformerEncoder} (also in \texttt{src/models/encoder.py})
+	\end{enumerate}
+	
+	The encoder produces a spatial feature map which is consumed by independent decoders (one decoder per target variable) implemented as \texttt{Decoder} and wrapped in \texttt{MultiDecoder} (\texttt{src/models/decoder.py}).
+	
+	\subsection{FiLM conditioning}
+	Temporal conditioning by lead time is implemented using FiLM (Feature-wise Linear Modulation). Components:
+	\begin{itemize}
+		\item \texttt{LeadTimeEmbedding} -- learnable embedding for discrete lead indices (0..N-1).
+		\item \texttt{FiLMLayer} -- maps conditioning embedding to per-feature scale (\(\gamma\)) and shift (\(\beta\)) and applies $\gamma \cdot x + \beta$ to feature maps.
+	\end{itemize}
+	For the CNN encoder FiLM modules are integrated inside residual blocks; for the ViT encoder FiLM is applied after encoding.
+	
+	\subsection{Decoder and outputs}
+	Each target variable uses an independent decoder head that maps the shared feature map to a single-channel spatial prediction. The decoder consists of a sequence of convolutional layers with batch-normalization and LeakyReLU activations; the final convolution maps to one channel and (if needed) predictions are upsampled to the target spatial resolution.
+	
+	\section{Loss functions}
+	Loss code lives under \texttt{src/losses/} and is split into data-driven losses and physics-informed constraints.
+	
+	\subsection{Data-driven losses}
+	Implemented losses include:
+	\begin{itemize}
+		\item Mean Squared Error (MSE):
+		\[ L_{\mathrm{MSE}} = \frac{1}{N}\sum_{i=1}^N (y_i - \hat y_i)^2. \]
+		\item Mean Absolute Error (MAE):
+		\[ L_{\mathrm{MAE}} = \frac{1}{N}\sum_{i=1}^N |y_i - \hat y_i|. \]
+		\item Hybrid MSE-MAE: weighted combination used for heavy-tailed variables (e.g., precipitation): $L = \alpha L_{\mathrm{MSE}} + (1-\alpha) L_{\mathrm{MAE}}$.
+		\item Tweedie deviance: implemented for precipitation-like variables (compound Poisson-Gamma family, $1<p<2$). The deviance used is:
+		\[ D(y, \mu) = 2 \left[ \frac{y^{2-p}}{(1-p)(2-p)} - \frac{y\mu^{1-p}}{1-p} + \frac{\mu^{2-p}}{2-p} \right]. \]
+	\end{itemize}
+	
+	\subsection{Physics-informed losses}
+	The physics losses are modular and can be enabled/disabled via config. Implemented components include:
+	\begin{itemize}
+		\item Clausius--Clapeyron consistency (approximate): constrains the relationship between temperature and relative humidity.
+		\item Temperature consistency: enforce $T_{\max} \ge T_{\mathrm{mean}}$ using a soft-margin squared penalty.
+		\item Humidity bounds: penalize predictions outside a soft margin around [0,100]\% RH.
+		\item Precipitation non-negativity: penalize negative precipitation values.
+		\item Spatial smoothness: penalize spatial gradients (first or second order) to discourage unrealistic discontinuities.
+	\end{itemize}
+	
+	The combined loss used during training is a weighted sum of data losses (per-variable) and physics losses:
+	\[ L_{\mathrm{total}} = L_{\mathrm{data}} + \lambda_{\mathrm{phys}} L_{\mathrm{physics}} \]
+	where $L_{\mathrm{data}}$ is the (possibly weighted) sum of per-variable data losses and $\lambda_{\mathrm{phys}}$ is configurable (see \texttt{configs/default\_4.yml}).
+	
+	\section{Training procedure}
+	Training is implemented in \texttt{src/training/trainer.py} using a two-stage strategy:
+	\begin{enumerate}
+		\item Stage 1: train with data loss only (physics terms disabled) for \texttt{stage1\_epochs} epochs.
+		\item Stage 2: fine-tune with physics losses enabled (data + physics) for the remaining epochs.
+	\end{enumerate}
+	
+	Important training features:
+	\begin{itemize}
+		\item Automatic Mixed Precision (AMP) support via PyTorch's \texttt{autocast} and \texttt{GradScaler}.
+		\item Gradient clipping (configurable \texttt{gradient\_clip\_val}).
+		\item Checkpointing and best-model saving (rank-0 only in distributed runs).
+		\item Optional distributed "server-mode" where rank-0 broadcasts batches to workers.
+		\item Support for commonly used optimizers (AdamW, SGD) and schedulers (cosine, step, plateau).
+	\end{itemize}
+	
+	\subsection{Typical hyperparameters}
+	See \texttt{configs/default\_4.yml} for a full example; highlights:
+	\begin{itemize}
+		\item \texttt{batch\_size: 240}
+		\item \texttt{max\_epochs: 100}
+		\item \texttt{stage1\_epochs: 50}
+		\item \texttt{optimizer.lr: 1e-5}
+		\item \texttt{use\_amp: true}
+		\item Physics weight: \texttt{physics\_weight: 0.02} (default in the example config)
+	\end{itemize}
+	
+	\section{Inference and analysis}
+	Use \texttt{scripts/infer.py} to run model inference on test sets and \texttt{scripts/analyze\_inference\_outputs.py} for post-processing, metrics and plotting. Predictions are saved when configured (see \texttt{configs/default\_4.yml}).
+	
+	\section{Configuration and experiments}
+	Experiment settings are centralized in YAML files under \texttt{configs/}. The loader reads choices such as normalization method, train/val/test year splits, model type (\texttt{cnn} or \texttt{vit}), FiLM usage, optimizer, scheduler, and loss settings. Example:
+	\begin{itemize}
+		\item \texttt{model.encoder\_type: "cnn"}
+		\item \texttt{model.target\_vars: ["tasERA","tasmaxERA","tpERA","rhERA"]}
+		\item \texttt{loss.use\_physics: false} (stage 1)
+	\end{itemize}
+	
+	\section{Testing}
+	There are tests under \texttt{tests/} (e.g., \texttt{tests/test\_data\_loader.py}) covering basic loader functionality. Run tests with \texttt{pytest} from the \texttt{code} directory.
+	
+	\section{Extending the code}
+	Guidelines:
+	\begin{itemize}
+		\item To add a new variable, update \texttt{DecadalDataLoader.input\_vars/target\_vars} and ensure the netCDF contains that variable and appropriate preprocessing in the loader.
+		\item To add new loss terms, create a callable loss class under \texttt{src/losses} and integrate it into \texttt{PhysicsInformedLoss} or \texttt{MultiVariableDataLoss}.
+		\item To add a new encoder, implement it in \texttt{src/models/} and add selection logic in \texttt{ClimateNet.\_\_init\_\_}.
+	\end{itemize}
+	
+	\section{Reproducing experiments}
+	To reproduce an experiment:
+	\begin{enumerate}
+		\item Use the same config YAML and environment (record package versions).
+		\item Ensure the same random seed (\texttt{seed} in config).
+		\item Use the provided cached valid combinations if available (cache files under \texttt{cache/}).
+	\end{enumerate}
+	
+	\section{Appendix: Important equations}
+	\subsection{FiLM transformation}
+	Given conditioning vector $c$ and feature map $x$, FiLM produces:
+	\[ \gamma = f_{\gamma}(c),\quad \beta = f_{\beta}(c) \\
+	\mathrm{FiLM}(x;c) = \gamma \otimes x + \beta \]
+	where $f_{\gamma}, f_{\beta}$ are MLPs producing per-channel scale and shift and $\otimes$ denotes channel-wise broadcast.
+	
+	\subsection{Tweedie deviance}
+	As implemented in \texttt{src/losses/data\_losses.py} the Tweedie deviance for $1<p<2$ is:
+	\[ D(y, \mu) = 2 \left[ \frac{y^{2-p}}{(1-p)(2-p)} - \frac{y\mu^{1-p}}{1-p} + \frac{\mu^{2-p}}{2-p} \right]. \]
+	
+	\section{Contact and contributions}
+	If you plan to extend or use this repository, please contact the repository owner or open an issue/pull request describing your change. Follow the project's coding style and add tests for new functionality.
+	
+	\vfill\noindent
+	\textbf{File created:} DOCUMENTATION.tex (placed at project root of the \texttt{code} folder).
+\end{document}

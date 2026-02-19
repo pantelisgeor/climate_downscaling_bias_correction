@@ -6,9 +6,9 @@
 #SBATCH --nodes=1
 #SBATCH -A aiml
 #SBATCH --ntasks-per-node=24
-#SBATCH --gres=gpu:3
-#SBATCH --mem=164G
-#SBATCH -p gpu
+#SBATCH --gres=gpu:2
+#SBATCH --mem=200G
+#SBATCH -p a100
 
 set -euo pipefail
 
@@ -58,6 +58,25 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
   exit 1
 fi
 
+# Read test years from config for inference.
+TEST_YEARS_CSV=$(python - "$CONFIG_PATH" <<'PY'
+import sys
+import yaml
+
+cfg_path = sys.argv[1]
+with open(cfg_path, "r") as f:
+    cfg = yaml.safe_load(f)
+
+test_years = cfg.get("data", {}).get("test_years", [])
+print(",".join(str(y) for y in test_years))
+PY
+)
+
+if [[ -z "$TEST_YEARS_CSV" ]]; then
+  echo "ERROR: Could not resolve data.test_years from config: $CONFIG_PATH"
+  exit 1
+fi
+
 CHECKPOINT_DIR="$EXPERIMENT_DIR/checkpoints"
 RESUME_PATH=""
 
@@ -96,3 +115,18 @@ fi
 
 echo "Running command: ${CMD[*]}"
 "${CMD[@]}"
+
+INFER_DIR="$EXPERIMENT_DIR/inferred"
+ANALYSIS_DIR="$EXPERIMENT_DIR/analysis"
+
+echo "Running inference into: $INFER_DIR"
+python scripts/infer.py \
+  --experiment-dir "$EXPERIMENT_DIR" \
+  --checkpoint best \
+  --years "$TEST_YEARS_CSV" \
+  --output-dir "$INFER_DIR"
+
+echo "Running analysis into: $ANALYSIS_DIR"
+python scripts/analyze_inference_outputs.py \
+  --input-dir "$INFER_DIR" \
+  --output-dir "$ANALYSIS_DIR"

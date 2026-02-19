@@ -178,6 +178,19 @@ class DecadalDataLoader:
             logger.info("Step 6/7: Using lazy loading (disk-based access)")
             logger.info("  Data will be read from disk as needed")
 
+        # Simple unit adjustment: divide `pr` by 1000 so it's on same order as `tpERA`
+        if "pr" in self.ds.data_vars:
+            try:
+                self.ds["pr"] = self.ds["pr"] / 1000.0
+                print(f"input: {self.ds['pr'].mean().item():.4f} - output: {self.ds['tpERA'].mean().item():.4f}")
+                try:
+                    self.ds["pr"].attrs["units"] = "mm"
+                except Exception:
+                    pass
+                logger.info("Divided 'pr' by 1000 to match 'tpERA' scale (mm).")
+            except Exception as e:
+                logger.warning(f"Failed to divide 'pr' by 1000: {e}")
+
         # Load or compute valid combinations
         logger.info("Step 7/7: Loading/computing valid combinations...")
         valid_start = time.time()
