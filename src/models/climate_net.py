@@ -28,6 +28,7 @@ class ClimateNet(nn.Module):
         vit_attention_dropout: float = 0.1,
         decoder_hidden_dims: List[int] = [512, 256, 128, 64],
         target_vars: List[str] = ["tasERA", "tasmaxERA", "tpERA", "rhERA"],
+        output_activations: Dict[str, str] = None,
         use_film: bool = True,
         num_leads: int = 11,
         lead_embed_dim: int = 128,
@@ -42,6 +43,7 @@ class ClimateNet(nn.Module):
 
         # Create encoder
         if encoder_type == "vit":
+            # (no change to encoder init)
             self.encoder = VisionTransformerEncoder(
                 in_channels=total_channels,
                 embed_dim=encoder_dim,
@@ -76,6 +78,7 @@ class ClimateNet(nn.Module):
             target_vars=target_vars,
             hidden_dims=decoder_hidden_dims,
             output_size=image_size,
+            output_activations=output_activations,
         )
 
         # Initialize weights for encoder and decoder

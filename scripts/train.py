@@ -639,6 +639,7 @@ def main(
         vit_attention_dropout=config["model"].get("vit_attention_dropout", 0.1),
         decoder_hidden_dims=config["model"]["decoder_hidden_dims"],
         target_vars=config["model"]["target_vars"],
+        output_activations=config["model"].get("output_activations", None),
         use_film=config["model"]["use_film"],
         num_leads=config["model"]["num_leads"],
         lead_embed_dim=config["model"]["lead_embed_dim"],

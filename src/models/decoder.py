@@ -96,7 +96,8 @@ class MultiDecoder(nn.Module):
         input_dim: int = 512,
         target_vars: List[str] = ["tasERA", "tasmaxERA", "tpERA", "rhERA"],
         hidden_dims: List[int] = [512, 256, 128, 64],
-        output_size: tuple = (35, 77),  # Add target size
+        output_size: tuple = (35, 77),
+        output_activations: Dict[str, str] = None,
     ):
         """
         Initialize multi-decoder.
@@ -106,6 +107,7 @@ class MultiDecoder(nn.Module):
             target_vars: List of target variable names
             hidden_dims: Hidden dimensions for each decoder
             output_size: Target output spatial size (H, W)
+            output_activations: Dictionary mapping variable names to activations
         """
         super().__init__()
 
@@ -115,29 +117,13 @@ class MultiDecoder(nn.Module):
         # Create independent decoder for each target
         self.decoders = nn.ModuleDict()
 
-        # for var in target_vars:
-        #     # Use ReLU for precipitation (non-negative)
-        #     if var == "tpERA":
-        #         activation = "relu"
-        #     elif var == "rhERA":
-        #         activation = "none"  # Will apply bounds in loss
-        #     else:
-        #         activation = "none"
+        if output_activations is None:
+            output_activations = {}
 
-        #     self.decoders[var] = Decoder(
-        #         input_dim=input_dim,
-        #         hidden_dims=hidden_dims,
-        #         output_size=output_size,
-        #         output_activation=activation,
-        #     )
         for var in target_vars:
-            if var == "tpERA":
-                # Let the loss/physics enforce non-negativity; no hard ReLU here
-                activation = "none"
-            elif var == "rhERA":
-                activation = "none"
-            else:
-                activation = "none"
+            # Default to "none" if not specified
+            activation = output_activations.get(var, "none")
+            
             self.decoders[var] = Decoder(
                 input_dim=input_dim,
                 hidden_dims=hidden_dims,
