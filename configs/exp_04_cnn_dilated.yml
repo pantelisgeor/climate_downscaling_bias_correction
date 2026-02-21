@@ -48,7 +48,7 @@ model:
   decoder_hidden_dims: [512, 256, 128, 64]
   target_vars: ["tasERA", "tasmaxERA", "tpERA", "rhERA"]
   output_activations:
-    tpERA: "relu"
+    tpERA: "softplus"
   use_film: true
   num_leads: 11
   lead_embed_dim: 128
@@ -68,7 +68,7 @@ scheduler:
   gamma: 0.1
 
 training:
-  batch_size: 200
+  batch_size: 256
   max_epochs: 100
   stage1_epochs: 50
   gradient_clip_val: 1.0

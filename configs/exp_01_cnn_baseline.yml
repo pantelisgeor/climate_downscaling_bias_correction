@@ -2,12 +2,12 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # EXPERIMENT 01 — CNN baseline (control)
 # Purpose : Stable anchor for all subsequent ablations. No physics losses.
-#            Only the data-loss bug-fixes: relu on tpERA, wethybrid for precip.
+#            Only the data-loss bug-fixes: softplus on tpERA, wethybrid for precip.
 # Changes vs historical runs:
-#   - output_activations.tpERA = relu   (was missing → negative precip)
-#   - tpERA loss = wethybrid            (was tweedie → NaN with AMP)
-#   - wet_weight = 5.0 / dry_weight=1.0 (new: weights wet-day pixels 5×)
-#   - physics OFF                       (isolate data-loss behaviour first)
+#   - output_activations.tpERA = softplus (relu caused dead neurons → 0 precip)
+#   - tpERA loss = wethybrid              (was tweedie → NaN with AMP)
+#   - wet_weight = 5.0 / dry_weight=1.0  (new: weights wet-day pixels 5×)
+#   - physics OFF                         (isolate data-loss behaviour first)
 # ──────────────────────────────────────────────────────────────────────────────
 
 experiment:
@@ -46,7 +46,7 @@ model:
   decoder_hidden_dims: [512, 256, 128, 64]
   target_vars: ["tasERA", "tasmaxERA", "tpERA", "rhERA"]
   output_activations:
-    tpERA: "relu"             # enforce non-negativity in normalised space
+    tpERA: "softplus"             # enforce non-negativity in normalised space
   use_film: true
   num_leads: 11               # lead times 0-10
   lead_embed_dim: 128
@@ -66,7 +66,7 @@ scheduler:
   gamma: 0.1
 
 training:
-  batch_size: 200
+  batch_size: 256
   max_epochs: 100
   stage1_epochs: 50           # epochs 1-50 data-loss only; 51-100 adds physics
   gradient_clip_val: 1.0
@@ -91,7 +91,7 @@ loss:
   use_clausius_clapeyron: false
   use_temp_consistency: false
   use_humidity_bounds: false
-  use_precip_nonnegativity: false  # always zero when relu is active; skip
+  use_precip_nonnegativity: false  # always near-zero with softplus; skip
   use_spatial_smoothness: false
 
 logging:

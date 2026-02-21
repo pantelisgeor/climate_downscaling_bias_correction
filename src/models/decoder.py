@@ -58,6 +58,8 @@ class Decoder(nn.Module):
             self.output_activation = nn.Sigmoid()
         elif output_activation == "relu":
             self.output_activation = nn.ReLU()
+        elif output_activation == "softplus":
+            self.output_activation = nn.Softplus()
         else:
             self.output_activation = nn.Identity()
 
@@ -155,6 +157,8 @@ class SharedDecoder(nn.Module):
                 self.activations.append(nn.Sigmoid())
             elif act == "relu":
                 self.activations.append(nn.ReLU())
+            elif act == "softplus":
+                self.activations.append(nn.Softplus())
             else:
                 self.activations.append(nn.Identity())
 

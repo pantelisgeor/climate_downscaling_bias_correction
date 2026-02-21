@@ -14,7 +14,7 @@
 #     recommendations to avoid instability with this small domain size.
 #
 # Historical failures: default_ViT used lr=5e-4 + tweedie → NaN.
-#                      default_ViT_relu used lr=5e-4 + tweedie → NaN.
+#                      default_ViT_relu used lr=5e-4 + relu+tweedie → NaN.
 #           This run: lr=5e-5 + wethybrid (same safe recipe as CNN runs).
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -60,7 +60,7 @@ model:
   vit_dropout: 0.1
   vit_attention_dropout: 0.1
   output_activations:
-    tpERA: "relu"
+    tpERA: "softplus"
   use_film: true
   num_leads: 11
   lead_embed_dim: 128
