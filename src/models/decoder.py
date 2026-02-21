@@ -86,6 +86,104 @@ class Decoder(nn.Module):
         return out
 
 
+class SharedDecoder(nn.Module):
+    """
+    Single shared decoder for all target variables.
+
+    A common CNN trunk maps the encoder features to the final hidden
+    representation; a single 1×1 conv then produces one output channel per
+    target variable in one shot.  Per-variable output activations are applied
+    channel-wise after the shared trunk so that, e.g., only precipitation is
+    passed through ReLU.
+
+    Compared with MultiDecoder the total parameter count is lower (one trunk
+    instead of N identical trunks) but the model is forced to share
+    intermediate representations across variables.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 512,
+        target_vars: List[str] = ["tasERA", "tasmaxERA", "tpERA", "rhERA"],
+        hidden_dims: List[int] = [512, 256, 128, 64],
+        output_size: tuple = (35, 77),
+        output_activations: Dict[str, str] = None,
+    ):
+        """
+        Initialize shared decoder.
+
+        Args:
+            input_dim: Input feature dimension from encoder
+            target_vars: Ordered list of target variable names
+            hidden_dims: Hidden dimensions of the shared CNN trunk
+            output_size: Target output spatial size (H, W)
+            output_activations: Dict mapping variable names to activation
+                                 ('none', 'relu', 'sigmoid')
+        """
+        super().__init__()
+
+        self.target_vars = target_vars
+        self.num_targets = len(target_vars)
+        self.output_size = output_size
+
+        if output_activations is None:
+            output_activations = {}
+        self.output_activations_cfg = output_activations
+
+        # Shared trunk
+        layers = []
+        in_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.extend(
+                [
+                    nn.Conv2d(in_dim, hidden_dim, 3, padding=1),
+                    nn.BatchNorm2d(hidden_dim),
+                    nn.LeakyReLU(0.2, inplace=True),
+                ]
+            )
+            in_dim = hidden_dim
+
+        # Final 1×1 conv: outputs one channel per target variable
+        layers.append(nn.Conv2d(in_dim, self.num_targets, 1))
+        self.trunk = nn.Sequential(*layers)
+
+        # Per-variable output activations (applied per-channel after the trunk)
+        self.activations = nn.ModuleList()
+        for var in target_vars:
+            act = output_activations.get(var, "none")
+            if act == "sigmoid":
+                self.activations.append(nn.Sigmoid())
+            elif act == "relu":
+                self.activations.append(nn.ReLU())
+            else:
+                self.activations.append(nn.Identity())
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass through the shared trunk.
+
+        Args:
+            x: Encoded features [batch, input_dim, H_enc, W_enc]
+
+        Returns:
+            Dictionary mapping variable names to predictions [batch, 1, H_target, W_target]
+        """
+        out = self.trunk(x)  # [B, num_targets, H_enc, W_enc]
+
+        # Upsample to target size if needed
+        if out.shape[2:] != self.output_size:
+            out = F.interpolate(
+                out, size=self.output_size, mode="bilinear", align_corners=False
+            )
+
+        # Split into per-variable tensors and apply activations
+        outputs = {}
+        for i, (var, act) in enumerate(zip(self.target_vars, self.activations)):
+            outputs[var] = act(out[:, i : i + 1, :, :])  # [B, 1, H, W]
+
+        return outputs
+
+
 class MultiDecoder(nn.Module):
     """
     Multiple independent decoders for all target variables.

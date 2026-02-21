@@ -18,14 +18,15 @@ class ResidualBlock(nn.Module):
         out_channels: int,
         use_film: bool = True,
         lead_embed_dim: int = 128,
+        dilation: int = 1,
     ):
         super().__init__()
 
         self.use_film = use_film
 
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=dilation, dilation=dilation)
         self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=dilation, dilation=dilation)
         self.bn2 = nn.BatchNorm2d(out_channels)
 
         # Skip connection
@@ -79,6 +80,7 @@ class CNNEncoder(nn.Module):
         use_film: bool = True,
         num_leads: int = 11,
         lead_embed_dim: int = 128,
+        dilations: List[int] = None,
     ):
         """
         Initialize CNN encoder.
@@ -92,10 +94,17 @@ class CNNEncoder(nn.Module):
             use_film: Whether to use FiLM conditioning
             num_leads: Number of lead time values
             lead_embed_dim: Lead time embedding dimension
+            dilations: List of dilations for each block (optional)
         """
         super().__init__()
 
         self.use_film = use_film
+
+        if dilations is None:
+            dilations = [1] * num_blocks
+
+        if len(dilations) != num_blocks:
+            raise ValueError(f"dilations list must have length {num_blocks}")
 
         # Lead time embedding
         if use_film:
@@ -128,6 +137,9 @@ class CNNEncoder(nn.Module):
             base_channels * 4,
             base_channels * 4,
             output_dim,
+            output_dim,
+            output_dim,
+            output_dim,
         ]
 
         self.dynamic_blocks = nn.ModuleList()
@@ -140,7 +152,7 @@ class CNNEncoder(nn.Module):
             )
 
             self.dynamic_blocks.append(
-                ResidualBlock(in_ch, out_ch, use_film, lead_embed_dim)
+                ResidualBlock(in_ch, out_ch, use_film, lead_embed_dim, dilation=dilations[i])
             )
 
         self.dynamic_init = nn.Sequential(*dynamic_layers)

@@ -1,0 +1,105 @@
+# exp_06_cnn_smooth.yml
+# ──────────────────────────────────────────────────────────────────────────────
+# EXPERIMENT 06 — CNN + full physics + spatial smoothness
+# Purpose : Test the full physics + spatial-smoothness combination on top of the
+#           CNN baseline. Spatial smoothness (TV/gradient regularisation) was
+#           previously suspected to reduce horizontal-line artefacts seen in
+#           early CNN outputs. Physics constraint weight kept at 0.02 (safe).
+#           This is the most heavily regularised CNN variant.
+# Key differences vs exp_02 (physics only):
+#   - use_spatial_smoothness: true
+#   - spatial_smooth_weight: 0.005  (light; enough to reduce artefacts without
+#                                    blurring spatial gradients)
+# ──────────────────────────────────────────────────────────────────────────────
+
+experiment:
+  name: "cnn_smooth"
+  base_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments"
+  output_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments/exp_06_cnn_smooth"
+  description: "CNN multi-decoder, wethybrid, physics + spatial smoothness (weight=0.005)"
+
+seed: 42
+
+data:
+  nc_path: "/nvme/h/pgeorgiades/scratch/full_dataset.nc"
+  cache_dir: "./cache"
+  load_in_memory: true
+  rank0_only_in_memory_load: true
+  rank0_batch_broadcast: false
+  normalize: true
+  normalize_samples: 100000
+  normalize_method: "minmax"
+  train_years: [1981, 1982, 1983, 1984, 1985, 1986, 1987, 1988, 1989,
+                1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999,
+                2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009,
+                2010, 2011, 2012]
+  val_years: [2013, 2014, 2015, 2016]
+  test_years: [2017, 2018, 2019, 2020]
+  num_workers: 12
+
+model:
+  static_channels: 3
+  dynamic_channels: 16
+  image_size: [35, 77]
+  encoder_type: "cnn"
+  encoder_dim: 512
+  encoder_blocks: 5
+  decoder_type: "multi"
+  decoder_hidden_dims: [512, 256, 128, 64]
+  target_vars: ["tasERA", "tasmaxERA", "tpERA", "rhERA"]
+  output_activations:
+    tpERA: "relu"
+  use_film: true
+  num_leads: 11
+  lead_embed_dim: 128
+
+optimizer:
+  type: "adamw"
+  lr: !!float 1e-5
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+scheduler:
+  type: "cosine"
+  min_lr: !!float 1e-7
+  factor: 0.5
+  patience: 5
+  step_size: 30
+  gamma: 0.1
+
+training:
+  batch_size: 200
+  max_epochs: 100
+  stage1_epochs: 50           # data-loss only for stage 1
+  gradient_clip_val: 1.0
+  early_stopping_patience: 15
+  save_every_n_epochs: 5
+  val_interval: 1
+  use_amp: true
+  device: "cuda"
+
+loss:
+  weighting_strategy: equal
+  data_loss_types:
+    tasERA: hybrid
+    tasmaxERA: hybrid
+    tpERA: wethybrid
+    rhERA: hybrid
+  wet_weight: 5.0
+  dry_weight: 1.0
+  # Physics + spatial smoothness — both active in stage 2
+  use_physics: true
+  physics_weight: 0.02
+  use_clausius_clapeyron: true
+  use_temp_consistency: true
+  use_humidity_bounds: true
+  use_precip_nonnegativity: false  # always zero with relu
+  use_spatial_smoothness: true
+  spatial_smooth_weight: 0.005    # light TV regularisation for artefact removal
+
+logging:
+  log_level: "INFO"
+  log_interval: 50
+
+evaluation:
+  save_predictions: true

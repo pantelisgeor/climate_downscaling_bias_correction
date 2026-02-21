@@ -471,7 +471,7 @@ def main(
             all_values = np.concatenate(values_list)
 
             # Apply log transform to precipitation before computing normalization params
-            if var_name == "tpERA":
+            if var_name in ["tpERA", "pr"]:
                 logger.info(f"  Applying log1p transform to {var_name}")
                 all_values = np.log1p(np.maximum(all_values, 0))
 
@@ -637,12 +637,14 @@ def main(
         vit_mlp_ratio=config["model"].get("vit_mlp_ratio", 4.0),
         vit_dropout=config["model"].get("vit_dropout", 0.1),
         vit_attention_dropout=config["model"].get("vit_attention_dropout", 0.1),
+        decoder_type=config["model"].get("decoder_type", "multi"),
         decoder_hidden_dims=config["model"]["decoder_hidden_dims"],
         target_vars=config["model"]["target_vars"],
         output_activations=config["model"].get("output_activations", None),
         use_film=config["model"]["use_film"],
         num_leads=config["model"]["num_leads"],
         lead_embed_dim=config["model"]["lead_embed_dim"],
+        dilations=config["model"].get("dilations", None),
     )
 
     model = model.to(device)
@@ -682,10 +684,16 @@ def main(
         use_clausius_clapeyron=config["loss"].get("use_clausius_clapeyron", False),
         use_temp_consistency=config["loss"].get("use_temp_consistency", False),
         use_humidity_bounds=config["loss"].get("use_humidity_bounds", False),
-        use_precip_nonnegativity=config["loss"].get(
-            "use_precip_nonnegativity", False
-        ),
+        use_precip_nonnegativity=config["loss"].get("use_precip_nonnegativity", False),
+        precip_nonneg_weight=config["loss"].get("precip_nonneg_weight", 0.2),
         use_spatial_smoothness=config["loss"].get("use_spatial_smoothness", False),
+        spatial_smooth_weight=config["loss"].get("spatial_smooth_weight", 0.01),
+        # Wet-day weighting for precipitation (wethybrid loss type)
+        wet_weight=config["loss"].get("wet_weight", 5.0),
+        dry_weight=config["loss"].get("dry_weight", 1.0),
+        # Pass scaler info so PhysicsInformedLoss can work in physical units
+        scalers=data_loader.scalers,
+        normalize_method=config["data"].get("normalize_method", "minmax"),
     ).to(device)
 
     if rank == 0:

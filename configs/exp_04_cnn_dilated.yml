@@ -1,0 +1,103 @@
+# exp_04_cnn_dilated.yml
+# ──────────────────────────────────────────────────────────────────────────────
+# EXPERIMENT 04 — CNN with exponentially-increasing dilations
+# Purpose : Increase spatial receptive field from ~5px to ~30px using dilated
+#           convolutions (rates 1,2,4,8,16). The original Cyprus domain is only
+#           35×77 pixels — a wider receptive field may better capture synoptic
+#           patterns (e.g. Mediterranean cyclones spanning the full domain).
+#           default_8 used this but with lr=1e-4 + tweedie → NaN epoch 4.
+#           This run replicates the architecture but with safe lr=1e-5 + wethybrid.
+# Key differences vs exp_01:
+#   - dilations: [1, 2, 4, 8, 16]
+# ──────────────────────────────────────────────────────────────────────────────
+
+experiment:
+  name: "cnn_dilated"
+  base_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments"
+  output_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments/exp_04_cnn_dilated"
+  description: "Dilated CNN (rates 1-2-4-8-16), wethybrid, no physics — wider receptive field"
+
+seed: 42
+
+data:
+  nc_path: "/nvme/h/pgeorgiades/scratch/full_dataset.nc"
+  cache_dir: "./cache"
+  load_in_memory: true
+  rank0_only_in_memory_load: true
+  rank0_batch_broadcast: false
+  normalize: true
+  normalize_samples: 100000
+  normalize_method: "minmax"
+  train_years: [1981, 1982, 1983, 1984, 1985, 1986, 1987, 1988, 1989,
+                1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999,
+                2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009,
+                2010, 2011, 2012]
+  val_years: [2013, 2014, 2015, 2016]
+  test_years: [2017, 2018, 2019, 2020]
+  num_workers: 12
+
+model:
+  static_channels: 3
+  dynamic_channels: 16
+  image_size: [35, 77]
+  encoder_type: "cnn"
+  encoder_dim: 512
+  encoder_blocks: 5
+  dilations: [1, 2, 4, 8, 16]   # exponentially-increasing dilation rates
+  decoder_type: "multi"
+  decoder_hidden_dims: [512, 256, 128, 64]
+  target_vars: ["tasERA", "tasmaxERA", "tpERA", "rhERA"]
+  output_activations:
+    tpERA: "relu"
+  use_film: true
+  num_leads: 11
+  lead_embed_dim: 128
+
+optimizer:
+  type: "adamw"
+  lr: !!float 1e-5            # halved vs default_8 (1e-4 → NaN with old loss)
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+scheduler:
+  type: "cosine"
+  min_lr: !!float 1e-7
+  factor: 0.5
+  patience: 5
+  step_size: 30
+  gamma: 0.1
+
+training:
+  batch_size: 200
+  max_epochs: 100
+  stage1_epochs: 50
+  gradient_clip_val: 1.0
+  early_stopping_patience: 15
+  save_every_n_epochs: 5
+  val_interval: 1
+  use_amp: true
+  device: "cuda"
+
+loss:
+  weighting_strategy: equal
+  data_loss_types:
+    tasERA: hybrid
+    tasmaxERA: hybrid
+    tpERA: wethybrid
+    rhERA: hybrid
+  wet_weight: 5.0
+  dry_weight: 1.0
+  use_physics: false
+  physics_weight: 0.0
+  use_clausius_clapeyron: false
+  use_temp_consistency: false
+  use_humidity_bounds: false
+  use_precip_nonnegativity: false
+  use_spatial_smoothness: false
+
+logging:
+  log_level: "INFO"
+  log_interval: 50
+
+evaluation:
+  save_predictions: true

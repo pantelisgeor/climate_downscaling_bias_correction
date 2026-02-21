@@ -541,7 +541,7 @@ class DecadalDataLoader:
             )
 
         # Apply log transform to precipitation
-        if var_name == "tpERA":
+        if var_name in ["tpERA", "pr"]:
             data = np.log1p(np.maximum(data, 0))
 
         if self.normalize_method == "minmax":

@@ -309,6 +309,8 @@ class CombinedLoss(nn.Module):
         data_loss_types: Optional[Dict[str, str]] = None,
         tweedie_power: float = 1.5,
         tweedie_eps: float = 1e-6,
+        wet_weight: float = 5.0,
+        dry_weight: float = 1.0,
         **kwargs,
     ):
         """
@@ -322,7 +324,11 @@ class CombinedLoss(nn.Module):
             data_loss_types: Per-target data loss function selection
             tweedie_power: Tweedie p parameter for tweedie data loss
             tweedie_eps: Clamp epsilon for tweedie prediction mean
-            **kwargs: Additional arguments for weighting strategy
+            wet_weight: Up-weight for wet (non-zero) precipitation pixels
+                        when using 'wethybrid' loss type.
+            dry_weight: Weight for dry (zero) precipitation pixels in
+                        'wethybrid' loss.
+            **kwargs: Additional arguments forwarded to PhysicsInformedLoss
         """
         super().__init__()
 
@@ -339,6 +345,8 @@ class CombinedLoss(nn.Module):
             loss_types=data_loss_types,
             tweedie_power=tweedie_power,
             tweedie_eps=tweedie_eps,
+            wet_weight=wet_weight,
+            dry_weight=dry_weight,
         )
 
         # Physics loss

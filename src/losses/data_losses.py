@@ -189,6 +189,68 @@ class TweedieDevianceLoss(nn.Module):
         return loss.mean()
 
 
+class WetDayHybridLoss(nn.Module):
+    """
+    Hybrid MSE-MAE loss with separate weighting for wet and dry days.
+
+    Precipitation targets are highly zero-inflated (dry days dominate).
+    Plain MSE/MAE therefore receives a gradient signal dominated by pulling
+    predictions toward zero.  This loss separates the two regimes:
+
+    - **Dry pixels** (target == 0): penalised with a small weight so the
+      network still learns to predict zero for no-rain situations.
+    - **Wet pixels** (target > wet_threshold): penalised with a higher weight
+      so the network sees meaningful gradient on the interesting cases.
+
+    Args:
+        alpha: MSE fraction (1-alpha = MAE fraction), same as HybridLoss.
+        wet_weight: Multiplier applied to the loss on wet pixels (default 5).
+        dry_weight: Multiplier applied to the loss on dry pixels (default 1).
+        wet_threshold: Minimum normalised target value to be considered "wet"
+                       (default 0.0, i.e. any positive value after log1p normalization).
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.7,
+        wet_weight: float = 5.0,
+        dry_weight: float = 1.0,
+        wet_threshold: float = 0.0,
+    ):
+        super().__init__()
+        self.alpha = alpha
+        self.wet_weight = wet_weight
+        self.dry_weight = dry_weight
+        self.wet_threshold = wet_threshold
+        self.mse = MSELoss()
+        self.mae = MAELoss()
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute wet-day-weighted hybrid loss."""
+        # Pixel-wise combined loss before weighting
+        per_pixel_mse = (pred - target) ** 2
+        per_pixel_mae = torch.abs(pred - target)
+        per_pixel = self.alpha * per_pixel_mse + (1.0 - self.alpha) * per_pixel_mae
+
+        # Build weight map: wet pixels get higher weight
+        wet_mask = (target > self.wet_threshold).float()
+        dry_mask = 1.0 - wet_mask
+        weight_map = self.wet_weight * wet_mask + self.dry_weight * dry_mask
+
+        per_pixel = per_pixel * weight_map
+
+        if mask is not None:
+            per_pixel = per_pixel * mask
+            return per_pixel.sum() / (mask.sum() + 1e-8)
+
+        return per_pixel.mean()
+
+
 class MultiVariableDataLoss(nn.Module):
     """
     Combined data loss for all target variables.
@@ -200,6 +262,8 @@ class MultiVariableDataLoss(nn.Module):
         loss_types: Dict[str, str] = None,
         tweedie_power: float = 1.5,
         tweedie_eps: float = 1e-6,
+        wet_weight: float = 5.0,
+        dry_weight: float = 1.0,
     ):
         """
         Initialize multi-variable data loss.
@@ -207,9 +271,13 @@ class MultiVariableDataLoss(nn.Module):
         Args:
             target_vars: List of target variable names
             loss_types: Dictionary mapping variable names to loss types
-                       Options: 'mse', 'mae', 'hybrid', 'tweedie'
+                       Options: 'mse', 'mae', 'hybrid', 'wethybrid', 'tweedie'
+                       Use 'wethybrid' for precipitation to handle zero-inflation.
             tweedie_power: Tweedie power parameter p for tweedie loss (1<p<2)
             tweedie_eps: Minimum clamp for prediction mean mu in tweedie loss
+            wet_weight: Up-weight multiplier for wet (non-zero target) pixels
+                        when using 'wethybrid' loss (default 5).
+            dry_weight: Weight for dry (zero target) pixels in 'wethybrid' (default 1).
         """
         super().__init__()
 
@@ -220,7 +288,7 @@ class MultiVariableDataLoss(nn.Module):
             loss_types = {
                 "tasERA": "mse",
                 "tasmaxERA": "mse",
-                "tpERA": "hybrid",  # Hybrid for precipitation
+                "tpERA": "wethybrid",  # Wet-day-weighted hybrid for precipitation
                 "rhERA": "mse",
             }
 
@@ -235,6 +303,12 @@ class MultiVariableDataLoss(nn.Module):
                 self.loss_functions[var] = MAELoss()
             elif loss_type == "hybrid":
                 self.loss_functions[var] = HybridLoss(alpha=0.7)
+            elif loss_type == "wethybrid":
+                self.loss_functions[var] = WetDayHybridLoss(
+                    alpha=0.7,
+                    wet_weight=wet_weight,
+                    dry_weight=dry_weight,
+                )
             elif loss_type == "tweedie":
                 self.loss_functions[var] = TweedieDevianceLoss(
                     power=tweedie_power, eps=tweedie_eps

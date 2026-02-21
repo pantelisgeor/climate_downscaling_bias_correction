@@ -6,12 +6,12 @@ import torch
 import torch.nn as nn
 from typing import Dict, List, Tuple
 from .encoder import CNNEncoder, VisionTransformerEncoder
-from .decoder import MultiDecoder
+from .decoder import MultiDecoder, SharedDecoder
 from .film_layer import FiLMLayer, LeadTimeEmbedding
 
 
 class ClimateNet(nn.Module):
-    """Single-Encoder Multi-Decoder (1EMD) architecture."""
+    """Single-Encoder Multi-Decoder (1EMD) or Single-Encoder Single-Decoder architecture."""
 
     def __init__(
         self,
@@ -26,12 +26,14 @@ class ClimateNet(nn.Module):
         vit_mlp_ratio: float = 4.0,
         vit_dropout: float = 0.1,
         vit_attention_dropout: float = 0.1,
+        decoder_type: str = "multi",
         decoder_hidden_dims: List[int] = [512, 256, 128, 64],
         target_vars: List[str] = ["tasERA", "tasmaxERA", "tpERA", "rhERA"],
         output_activations: Dict[str, str] = None,
         use_film: bool = True,
         num_leads: int = 11,
         lead_embed_dim: int = 128,
+        dilations: List[int] = None,
     ):
         super().__init__()
 
@@ -67,19 +69,29 @@ class ClimateNet(nn.Module):
                 use_film=use_film,
                 num_leads=num_leads,
                 lead_embed_dim=lead_embed_dim,
+                dilations=dilations,
             )
 
         else:
             raise ValueError(f"Unknown encoder type: {encoder_type}")
 
         # Create decoder
-        self.decoder = MultiDecoder(
-            input_dim=encoder_dim,
-            target_vars=target_vars,
-            hidden_dims=decoder_hidden_dims,
-            output_size=image_size,
-            output_activations=output_activations,
-        )
+        if decoder_type == "shared":
+            self.decoder = SharedDecoder(
+                input_dim=encoder_dim,
+                target_vars=target_vars,
+                hidden_dims=decoder_hidden_dims,
+                output_size=image_size,
+                output_activations=output_activations,
+            )
+        else:  # "multi" (default) — one independent decoder per variable
+            self.decoder = MultiDecoder(
+                input_dim=encoder_dim,
+                target_vars=target_vars,
+                hidden_dims=decoder_hidden_dims,
+                output_size=image_size,
+                output_activations=output_activations,
+            )
 
         # Initialize weights for encoder and decoder
         self.apply(self._init_weights)

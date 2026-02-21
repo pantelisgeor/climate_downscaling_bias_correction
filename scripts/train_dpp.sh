@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=climate-train
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.err
+#SBATCH --output=/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/code/logs/%x_%j.out
+#SBATCH --error=/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/code/logs/%x_%j.err
 #SBATCH --time=24:00:00
 #SBATCH --nodes=1
 #SBATCH -A p236
@@ -9,9 +9,15 @@
 #SBATCH --gres=gpu:4
 #SBATCH --mem=185G
 #SBATCH -p gpu
+#SBATCH --chdir=/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/code
 
-source ~/miniconda3/bin/activate conda_env
-cd /nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/code
+# Ensure log directory exists before SLURM tries to open the output files
+mkdir -p /nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/code/logs
+
+# Activate the project conda environment.
+# source the conda init script first so 'conda activate' works in batch shells.
+source /nvme/h/pgeorgiades/miniconda3/etc/profile.d/conda.sh
+conda activate /nvme/h/pgeorgiades/data_p185/AI_downscale/conda_env
 
 set -euo pipefail
 
@@ -117,12 +123,16 @@ fi
 
 echo "Launching distributed training with NUM_GPUS=$NUM_GPUS"
 
+# Derive a unique master port from the SLURM job ID to avoid port collisions
+# when multiple jobs run concurrently on the same node.
+MASTER_PORT=$(( 29500 + (${SLURM_JOB_ID:-0} % 1000) ))
+
 torchrun \
     --nproc_per_node="$NUM_GPUS" \
     --nnodes=1 \
     --node_rank=0 \
     --master_addr=localhost \
-    --master_port=29500 \
+    --master_port="$MASTER_PORT" \
     scripts/train.py \
     --config "$CONFIG_PATH"
 

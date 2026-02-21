@@ -158,8 +158,10 @@ def build_model_from_config(config: dict, device: str) -> ClimateNet:
         vit_mlp_ratio=config["model"].get("vit_mlp_ratio", 4.0),
         vit_dropout=config["model"].get("vit_dropout", 0.1),
         vit_attention_dropout=config["model"].get("vit_attention_dropout", 0.1),
+        decoder_type=config["model"].get("decoder_type", "multi"),
         decoder_hidden_dims=config["model"]["decoder_hidden_dims"],
         target_vars=config["model"]["target_vars"],
+        output_activations=config["model"].get("output_activations", None),
         use_film=config["model"]["use_film"],
         num_leads=config["model"]["num_leads"],
         lead_embed_dim=config["model"]["lead_embed_dim"],
@@ -188,10 +190,20 @@ def denormalize_prediction_if_needed(
     normalize_enabled: bool,
     data_loader: DecadalDataLoader,
 ) -> np.ndarray:
-    """Denormalize prediction back to original units if normalization is enabled."""
+    """Denormalize prediction back to original units if normalization is enabled.
+
+    Precipitation (tpERA) is additionally clamped to >= 0 after denormalization
+    as a physical safeguard against any residual negative values that might
+    survive if the model's output activation was not applied correctly.
+    """
     if normalize_enabled and var_name in data_loader.scalers:
-        return data_loader.denormalize(pred.reshape(-1), var_name).reshape(pred.shape)
-    return pred
+        out = data_loader.denormalize(pred.reshape(-1), var_name).reshape(pred.shape)
+    else:
+        out = pred
+    # Physical constraint: precipitation cannot be negative
+    if var_name == "tpERA":
+        out = np.maximum(out, 0.0)
+    return out
 
 
 def main():
@@ -233,7 +245,7 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=1,
+        default=200,
         help="Reserved for future batched inference; currently inference runs per-sample",
     )
     args = parser.parse_args()
