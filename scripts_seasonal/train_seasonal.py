@@ -393,8 +393,20 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None,
         )
         nw = config["data"].get("num_workers", 4)
         bs = config["training"]["batch_size"]
-        # persistent_workers=True keeps the 12 worker processes alive between
-        # epochs, avoiding the expensive spawn/teardown cycle every epoch.
+
+        # Ranks that use lazy xarray (load_in_memory=False) must use
+        # num_workers=0.  With workers > 0, each forked worker tries to
+        # open/read the xarray dataset independently; 12 workers competing
+        # for disk on the first batch take so long that the in-memory rank
+        # finishes its batch and blocks at the DDP allreduce barrier —
+        # making the whole job appear hung.  Synchronous (num_workers=0)
+        # reads are slower per-batch but never stall the other rank.
+        if not data_loader.load_in_memory:
+            nw = 0
+            logger.info(
+                "  num_workers forced to 0 for lazy-xarray rank "
+                "(avoids DDP stall vs in-memory rank)."
+            )
         pw = nw > 0
 
         train_loader = DataLoader(train_dataset, batch_size=bs,

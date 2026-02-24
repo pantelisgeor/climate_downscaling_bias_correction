@@ -11,8 +11,10 @@ Mirrors DecadalDataLoader but adapted for the seasonal NetCDF structure:
       dem, rho, phi, sin_time, cos_time
   Ancillary (time, cci_class, lat, lon) :
       cci_agg
-  Lead variable (time, number, lat, lon) :
-      lead_time  [timedelta64[ns]] – converted to integer months 0-6
+  Lead variable (time, number) :
+      lead_month [int8] – integer forecast lead in months, 0–6
+                          (pre-computed by preprocess_seasonal_nc.py from
+                           the original lead_time timedelta64 variable)
 
   * tp is stored with the WRONG dimension order (number, lat, lon, time) in the
     source NetCDF.  It is transposed to (time, number, lat, lon) at open time.
@@ -50,15 +52,6 @@ import pandas as pd
 import xarray as xr
 
 logger = logging.getLogger(__name__)
-
-# Average days per month used for timedelta → integer month conversion.
-_DAYS_PER_MONTH = 30.4375  # 365.25 / 12
-
-
-def _td_to_months(td_ns: int) -> int:
-    """Convert a timedelta64[ns] integer to the nearest integer month (0-6)."""
-    days = td_ns / 1e9 / 86400
-    return int(round(days / _DAYS_PER_MONTH))
 
 
 class SeasonalDataLoader:
@@ -149,31 +142,15 @@ class SeasonalDataLoader:
         except Exception as e:
             raise IOError(f"Failed to open {self.nc_path}: {e}")
 
-        # Fix tp dimension order: (number, lat, lon, time) → (time, number, lat, lon)
-        if "tp" in self.ds.data_vars:
-            tp_dims = self.ds["tp"].dims
-            if tp_dims != ("time", "number", "latitude", "longitude"):
-                logger.info(
-                    f"  Transposing 'tp' from {tp_dims} "
-                    f"→ ('time','number','latitude','longitude')"
-                )
-                self.ds["tp"] = self.ds["tp"].transpose(
-                    "time", "number", "latitude", "longitude"
-                )
-
         self._validate_dataset()
 
-        # tp and tpERA are already on the same scale in this dataset
-        # (both ~0.0012, daily values in m/day).  No unit conversion needed.
+        # tp and tpERA share the same scale (both daily values, m/day).
         logger.info("  'tp' and 'tpERA' share the same unit scale — no conversion applied.")
 
-        # ── precompute lead months (with NetCDF cache) ───────────────────────
-        # lead_time has shape (time, number, lat, lon).  Averaging over lat/lon
-        # triggers a full read of this large variable on every startup.  Cache
-        # the resulting (n_time, n_number) integer array as a small NetCDF file
-        # next to the source dataset so subsequent runs skip the computation.
-        logger.info("Lead months: checking cache …")
-        self._lead_months = self._load_or_compute_lead_months()
+        # lead_month is pre-computed int8 (time, number) in the canonical NC.
+        # No runtime conversion or cache needed — just read it directly.
+        logger.info("  Reading pre-computed lead_month …")
+        self._lead_months = self.ds["lead_month"].values  # (n_time, n_number) int8
 
         # ── valid combinations ────────────────────────────────────────────────
         logger.info("Loading / computing valid combinations …")
@@ -324,78 +301,37 @@ class SeasonalDataLoader:
             raise KeyError(f"Missing dimensions: {missing}")
 
         all_vars = self.fc_vars + self.static_vars + self.time_only_vars + \
-                   [self.cci_var, "lead_time"] + self.target_vars
+                   [self.cci_var, "lead_month"] + self.target_vars
         missing_vars = [v for v in all_vars if v not in self.ds.variables]
         if missing_vars:
+            # Give a clear error if the preprocessing script hasn't been run yet
+            if "lead_time" in self.ds.variables and "lead_month" not in self.ds.variables:
+                raise RuntimeError(
+                    "NetCDF is not in canonical form: 'lead_time' (timedelta64) is present "
+                    "but 'lead_month' (int8) is missing.\n"
+                    "Run the preprocessing script first:\n\n"
+                    "  conda run -p /nvme/h/pgeorgiades/data_p185/AI_downscale/conda_env "
+                    "python scripts_seasonal/preprocess_seasonal_nc.py "
+                    f"--nc_path {self.nc_path}\n"
+                )
             raise KeyError(f"Missing variables: {missing_vars}")
+
+        # Verify tp has canonical dimension order
+        if "tp" in self.ds.data_vars:
+            tp_dims = self.ds["tp"].dims
+            canonical = ("time", "number", "latitude", "longitude")
+            if tp_dims != canonical:
+                raise RuntimeError(
+                    f"'tp' has incorrect dimension order {tp_dims} (expected {canonical}).\n"
+                    "Run the preprocessing script first:\n\n"
+                    "  conda run -p /nvme/h/pgeorgiades/data_p185/AI_downscale/conda_env "
+                    "python scripts_seasonal/preprocess_seasonal_nc.py "
+                    f"--nc_path {self.nc_path}\n"
+                )
 
         for d in required_dims:
             logger.info(f"    • {d}: {len(self.ds[d])}")
-        logger.info(f"  ✓ All required variables present.")
-
-    def _get_lead_months_cache_path(self) -> Path:
-        """Return the path for the lead-months NetCDF cache (same dir as source NC)."""
-        nc = Path(self.nc_path)
-        file_size = nc.stat().st_size
-        h = hashlib.md5(f"{nc}_{file_size}".encode()).hexdigest()[:8]
-        return nc.parent / f"{nc.stem}_lead_months_{h}.nc"
-
-    def _load_or_compute_lead_months(self) -> np.ndarray:
-        """
-        Return a (n_time, n_number) int array of lead months.
-
-        On first call: computes from ds["lead_time"] (slow — full spatial read),
-        then saves to a small NetCDF next to the source dataset.
-        On subsequent calls: loads the cache file instantly.
-
-        Cache location: same directory as the source NetCDF,
-        e.g.  /path/to/training_seasonal_lead_months_<hash>.nc
-        """
-        cache_path = self._get_lead_months_cache_path()
-
-        if cache_path.exists() and not self.force_recompute:
-            try:
-                logger.info(f"  Loading lead-months cache: {cache_path.name} …")
-                t0 = time.time()
-                ds_cache = xr.open_dataset(cache_path)
-                arr = ds_cache["lead_months"].values.astype(int)
-                ds_cache.close()
-                logger.info(
-                    f"  Lead month range: {arr.min()} – {arr.max()}  "
-                    f"(loaded in {time.time()-t0:.1f}s)"
-                )
-                return arr
-            except Exception as e:
-                logger.warning(f"  Lead-months cache load failed ({e}); recomputing …")
-
-        logger.info("Pre-computing lead months (mean over spatial dims) …")
-        t0 = time.time()
-        lead_mean = self.ds["lead_time"].mean(dim=["latitude", "longitude"])
-        lead_mean_ns = lead_mean.values.astype("timedelta64[ns]").view(np.int64)
-        arr = np.round(lead_mean_ns / 1e9 / 86400 / _DAYS_PER_MONTH).astype(int)
-        logger.info(
-            f"  Lead month range: {arr.min()} – {arr.max()}  "
-            f"({time.time()-t0:.1f}s)"
-        )
-
-        try:
-            n_time, n_number = arr.shape
-            da = xr.DataArray(
-                arr,
-                dims=["time", "number"],
-                coords={
-                    "time":   self.ds.time.values,
-                    "number": self.ds.number.values,
-                },
-                name="lead_months",
-                attrs={"description": "Integer lead month (0–6) per (time, number) sample"},
-            )
-            da.to_netcdf(cache_path)
-            logger.info(f"  Lead-months cache saved: {cache_path.name}")
-        except Exception as e:
-            logger.warning(f"  Could not save lead-months cache: {e}")
-
-        return arr
+        logger.info(f"  ✓ All required variables present and in canonical form.")
 
     def _get_cache_filename(self) -> Path:
         try:
