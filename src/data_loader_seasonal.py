@@ -163,44 +163,17 @@ class SeasonalDataLoader:
 
         self._validate_dataset()
 
-        # ── optional in-memory load ───────────────────────────────────────────
-        if load_in_memory:
-            logger.info("Loading dataset into RAM …  (this may take a while)")
-            mem_start = time.time()
-            try:
-                self.ds = self.ds.load()
-                total_gb = sum(
-                    v.nbytes for v in self.ds.data_vars.values() if hasattr(v, "nbytes")
-                ) / 1024 ** 3
-                logger.info(
-                    f"  ✓ Loaded in {time.time()-mem_start:.1f}s  "
-                    f"({total_gb:.2f} GB)"
-                )
-            except MemoryError:
-                raise MemoryError(
-                    "Insufficient RAM to load dataset.  "
-                    "Try load_in_memory=False or use a larger machine."
-                )
-        else:
-            logger.info("  Using lazy (disk-based) loading.")
-
         # tp and tpERA are already on the same scale in this dataset
         # (both ~0.0012, daily values in m/day).  No unit conversion needed.
         logger.info("  'tp' and 'tpERA' share the same unit scale — no conversion applied.")
 
-        # ── precompute lead months ────────────────────────────────────────────
-        # lead_time has shape (time, number, lat, lon); average over lat/lon first.
-        logger.info("Pre-computing lead months (mean over spatial dims) …")
-        lead_mean = self.ds["lead_time"].mean(dim=["latitude", "longitude"])
-        # lead_mean: (time, number)  [timedelta64[ns] → float64 ns]
-        lead_mean_ns = lead_mean.values.astype("timedelta64[ns]").view(np.int64)
-        # Vectorised conversion to integer months
-        self._lead_months = np.round(
-            lead_mean_ns / 1e9 / 86400 / _DAYS_PER_MONTH
-        ).astype(int)  # shape (n_time, n_number)
-        logger.info(
-            f"  Lead month range: {self._lead_months.min()} – {self._lead_months.max()}"
-        )
+        # ── precompute lead months (with NetCDF cache) ───────────────────────
+        # lead_time has shape (time, number, lat, lon).  Averaging over lat/lon
+        # triggers a full read of this large variable on every startup.  Cache
+        # the resulting (n_time, n_number) integer array as a small NetCDF file
+        # next to the source dataset so subsequent runs skip the computation.
+        logger.info("Lead months: checking cache …")
+        self._lead_months = self._load_or_compute_lead_months()
 
         # ── valid combinations ────────────────────────────────────────────────
         logger.info("Loading / computing valid combinations …")
@@ -211,6 +184,39 @@ class SeasonalDataLoader:
             f"({time.time()-valid_start:.1f}s)"
         )
 
+        # Always build the lightweight index arrays used by __getitem__ and
+        # get_combination_info — needed on ALL ranks, including those that
+        # use load_in_memory=False.  These are tiny (~4 × N × 4 bytes).
+        self._build_vc_index_arrays()
+
+        if load_in_memory:
+            # Load each variable directly from lazy xarray into plain numpy
+            # arrays, one variable at a time.  Peak RAM = 1× dataset size.
+            #
+            # WHY NOT ds.load() first:
+            #   ds.load()  → X GB in xarray
+            #   .values.astype(float32) → another X GB copy  → PEAK 2×X  → OOM
+            #
+            # Loading lazy → numpy variable-by-variable keeps peak at ≈1×X GB.
+            # Workers forked by DataLoader use Linux copy-on-write, so read-only
+            # access to numpy arrays in __getitem__ never triggers real CoW
+            # page copies regardless of num_workers.
+            logger.info("Extracting variables to numpy arrays (lazy → numpy, no ds.load()) …")
+            np_start = time.time()
+            self._extract_numpy_arrays()
+            total_gb = (
+                sum(a.nbytes for a in self._np_fc.values())
+                + sum(a.nbytes for a in self._np_static.values())
+                + sum(a.nbytes for a in self._np_time.values())
+                + self._np_cci.nbytes
+                + sum(a.nbytes for a in self._np_targets.values())
+            ) / 1024 ** 3
+            logger.info(f"  ✓ {total_gb:.2f} GB extracted in {time.time()-np_start:.1f}s")
+            self.ds.close()
+            logger.info("  xarray Dataset closed; all data held as numpy arrays.")
+        else:
+            logger.info("  Using lazy (disk-based) xarray access (load_in_memory=false).")
+
         logger.info("=" * 70)
         logger.info(
             f"SEASONAL LOADER READY  –  {len(self.valid_combinations):,} samples  "
@@ -219,6 +225,97 @@ class SeasonalDataLoader:
         logger.info("=" * 70)
 
     # ── internal helpers ──────────────────────────────────────────────────────
+
+    def _extract_numpy_arrays(self):
+        """
+        Load all dataset variables from (lazy) xarray into plain numpy arrays.
+
+        Called once during __init__ (when load_in_memory=True).  By loading
+        directly from the lazy xarray dataset into numpy, variable by variable,
+        peak RAM is kept at ~1× the dataset size.  If ds.load() were called
+        first, peak RAM would be 2× (xarray copy + numpy copy).
+
+        After this method returns the xarray Dataset is closed by the caller.
+        All subsequent __getitem__ and get_combination_info calls use the numpy
+        arrays exclusively, so DataLoader workers (forked via Linux CoW) never
+        touch xarray and never trigger full page copies.
+
+        Arrays extracted
+        ----------------
+        _np_fc      : {var: (n_time, n_number, H, W)  float32}  forecast vars
+        _np_static  : {var: (H, W) or (n_time, H, W)  float32}  static vars
+        _np_time    : {var: (n_time, H, W)             float32}  time-only vars
+        _np_cci     : (n_time, n_class, H, W)           float32  cci_agg
+        _np_targets : {var: (n_time, H, W)             float32}  target vars
+        _np_times   : (n_time,)  datetime64  used by get_combination_info
+
+        Valid-combination index arrays
+        ------------------------------
+        _vc_number_idx : (N,) int32   positional member index per sample
+        _vc_time_idx   : (N,) int32   positional time  index per sample
+        _vc_lead_month : (N,) int32   lead month per sample
+        _vc_number     : (N,) int32   ensemble member value per sample
+        """
+        ds = self.ds
+
+        # Forecast variables: (time, number, lat, lon)
+        self._np_fc: Dict[str, np.ndarray] = {}
+        for var in self.fc_vars:
+            arr = ds[var].values.astype(np.float32)   # (T, N, H, W)
+            self._np_fc[var] = arr
+
+        # Static variables: (lat, lon) or (time, lat, lon)
+        self._np_static: Dict[str, np.ndarray] = {}
+        for var in self.static_vars:
+            v = ds[var]
+            if "time" in v.dims:
+                self._np_static[var] = v.values.astype(np.float32)   # (T, H, W)
+            else:
+                self._np_static[var] = v.values.astype(np.float32)   # (H, W)
+
+        # Time-only variables: (time, lat, lon)
+        self._np_time: Dict[str, np.ndarray] = {}
+        for var in self.time_only_vars:
+            self._np_time[var] = ds[var].values.astype(np.float32)   # (T, H, W)
+
+        # cci_agg: (time, cci_class, lat, lon)
+        self._np_cci: np.ndarray = ds[self.cci_var].values.astype(np.float32)
+
+        # Target variables: (time, lat, lon)
+        self._np_targets: Dict[str, np.ndarray] = {}
+        for var in self.target_vars:
+            self._np_targets[var] = ds[var].values.astype(np.float32)   # (T, H, W)
+
+        # Time coordinate (needed by get_combination_info when in-memory)
+        self._np_times: np.ndarray = ds.time.values   # (T,) datetime64
+
+        # static flags for __getitem__ (avoid repeated dim lookups)
+        self._static_has_time = {
+            var: ("time" in ds[var].dims) for var in self.static_vars
+        }
+
+    def _build_vc_index_arrays(self) -> None:
+        """
+        Build flat numpy index arrays from valid_combinations.
+
+        Called unconditionally after valid_combinations is populated so that
+        both the in-memory (load_in_memory=True) and lazy (load_in_memory=False)
+        ranks have fast O(1) lookup in __getitem__ and get_combination_info.
+
+        Also caches ds.time.values and the per-static-var has-time flag;
+        these are tiny and needed by get_combination_info on all ranks.
+        """
+        vc = self.valid_combinations
+        self._vc_number_idx = vc["number_idx"].to_numpy(dtype=np.int32)
+        self._vc_time_idx   = vc["time_idx"].to_numpy(dtype=np.int32)
+        self._vc_lead_month = vc["lead_month"].to_numpy(dtype=np.int32)
+        self._vc_number     = vc["number"].to_numpy(dtype=np.int32)
+        # Tiny time-coordinate array (one entry per time step)
+        self._np_times: np.ndarray = self.ds.time.values
+        # Per-static-var flag: does it have a time dimension?
+        self._static_has_time = {
+            var: ("time" in self.ds[var].dims) for var in self.static_vars
+        }
 
     def _validate_dataset(self):
         required_dims = ["time", "number", "latitude", "longitude", "cci_class"]
@@ -235,6 +332,70 @@ class SeasonalDataLoader:
         for d in required_dims:
             logger.info(f"    • {d}: {len(self.ds[d])}")
         logger.info(f"  ✓ All required variables present.")
+
+    def _get_lead_months_cache_path(self) -> Path:
+        """Return the path for the lead-months NetCDF cache (same dir as source NC)."""
+        nc = Path(self.nc_path)
+        file_size = nc.stat().st_size
+        h = hashlib.md5(f"{nc}_{file_size}".encode()).hexdigest()[:8]
+        return nc.parent / f"{nc.stem}_lead_months_{h}.nc"
+
+    def _load_or_compute_lead_months(self) -> np.ndarray:
+        """
+        Return a (n_time, n_number) int array of lead months.
+
+        On first call: computes from ds["lead_time"] (slow — full spatial read),
+        then saves to a small NetCDF next to the source dataset.
+        On subsequent calls: loads the cache file instantly.
+
+        Cache location: same directory as the source NetCDF,
+        e.g.  /path/to/training_seasonal_lead_months_<hash>.nc
+        """
+        cache_path = self._get_lead_months_cache_path()
+
+        if cache_path.exists() and not self.force_recompute:
+            try:
+                logger.info(f"  Loading lead-months cache: {cache_path.name} …")
+                t0 = time.time()
+                ds_cache = xr.open_dataset(cache_path)
+                arr = ds_cache["lead_months"].values.astype(int)
+                ds_cache.close()
+                logger.info(
+                    f"  Lead month range: {arr.min()} – {arr.max()}  "
+                    f"(loaded in {time.time()-t0:.1f}s)"
+                )
+                return arr
+            except Exception as e:
+                logger.warning(f"  Lead-months cache load failed ({e}); recomputing …")
+
+        logger.info("Pre-computing lead months (mean over spatial dims) …")
+        t0 = time.time()
+        lead_mean = self.ds["lead_time"].mean(dim=["latitude", "longitude"])
+        lead_mean_ns = lead_mean.values.astype("timedelta64[ns]").view(np.int64)
+        arr = np.round(lead_mean_ns / 1e9 / 86400 / _DAYS_PER_MONTH).astype(int)
+        logger.info(
+            f"  Lead month range: {arr.min()} – {arr.max()}  "
+            f"({time.time()-t0:.1f}s)"
+        )
+
+        try:
+            n_time, n_number = arr.shape
+            da = xr.DataArray(
+                arr,
+                dims=["time", "number"],
+                coords={
+                    "time":   self.ds.time.values,
+                    "number": self.ds.number.values,
+                },
+                name="lead_months",
+                attrs={"description": "Integer lead month (0–6) per (time, number) sample"},
+            )
+            da.to_netcdf(cache_path)
+            logger.info(f"  Lead-months cache saved: {cache_path.name}")
+        except Exception as e:
+            logger.warning(f"  Could not save lead-months cache: {e}")
+
+        return arr
 
     def _get_cache_filename(self) -> Path:
         try:
@@ -452,56 +613,72 @@ class SeasonalDataLoader:
         if idx < 0 or idx >= len(self):
             raise IndexError(f"Index {idx} out of range [0, {len(self)})")
 
-        combo = self.valid_combinations.iloc[idx]
-        number_idx = int(combo["number_idx"])
-        time_idx = int(combo["time_idx"])
+        # Fast O(1) lookup via pre-extracted numpy index arrays
+        number_idx = int(self._vc_number_idx[idx])
+        time_idx   = int(self._vc_time_idx[idx])
 
+        # ── fast path: all data already in numpy arrays ───────────────────────
+        if hasattr(self, "_np_fc"):
+            inputs = []
+
+            for var in self.fc_vars:
+                inputs.append(self._np_fc[var][time_idx, number_idx].flatten())
+
+            for var in self.static_vars:
+                if self._static_has_time[var]:
+                    inputs.append(self._np_static[var][time_idx].flatten())
+                else:
+                    inputs.append(self._np_static[var].flatten())
+
+            for var in self.time_only_vars:
+                inputs.append(self._np_time[var][time_idx].flatten())
+
+            cci_slice = self._np_cci[time_idx]      # (10, H, W)
+            n_cls = cci_slice.shape[0]
+            HW = cci_slice.shape[1] * cci_slice.shape[2]
+            cci_flat = cci_slice.reshape(n_cls, HW)
+            for c in range(n_cls):
+                inputs.append(cci_flat[c])
+
+            inputs_np = np.stack(inputs, axis=0)    # (19, H*W) float32
+
+            targets_np = np.stack(
+                [self._np_targets[var][time_idx].flatten() for var in self.target_vars],
+                axis=0,
+            )                                       # (4, H*W) float32
+
+            return inputs_np, targets_np
+
+        # ── slow path: lazy xarray (load_in_memory=False ranks) ──────────────
         inputs = []
 
-        # ── forecast channels 0-3 ────────────────────────────────────────────
-        for var in self.fc_vars:   # tp, t2m, tmax, hurs
-            data = (
-                self.ds[var]
-                .isel(time=time_idx, number=number_idx)
-                .values
-                .flatten()
+        for var in self.fc_vars:
+            inputs.append(
+                self.ds[var].isel(time=time_idx, number=number_idx).values.flatten()
             )
-            inputs.append(data)
 
-        # ── static channels 4-6 ──────────────────────────────────────────────
-        for var in self.static_vars:   # dem, rho, phi
-            var_data = self.ds[var]
-            if "time" in var_data.dims:
-                data = var_data.isel(time=time_idx).values.flatten()
+        for var in self.static_vars:
+            v = self.ds[var]
+            if self._static_has_time[var]:
+                inputs.append(v.isel(time=time_idx).values.flatten())
             else:
-                data = var_data.values.flatten()
-            inputs.append(data)
+                inputs.append(v.values.flatten())
 
-        # ── time-only channels 7-8 ───────────────────────────────────────────
-        for var in self.time_only_vars:   # sin_time, cos_time
-            data = self.ds[var].isel(time=time_idx).values.flatten()
-            inputs.append(data)
+        for var in self.time_only_vars:
+            inputs.append(self.ds[var].isel(time=time_idx).values.flatten())
 
-        # ── cci_agg channels 9-18 ────────────────────────────────────────────
-        cci_data = (
-            self.ds[self.cci_var]
-            .isel(time=time_idx)
-            .values   # (10, H, W)
-        )
+        cci_data = self.ds[self.cci_var].isel(time=time_idx).values  # (10, H, W)
         n_cls, H, W = cci_data.shape
         cci_flat = cci_data.reshape(n_cls, H * W)
         for c in range(n_cls):
             inputs.append(cci_flat[c])
 
-        inputs_np = np.stack(inputs, axis=0).astype(np.float32)  # (19, H*W)
+        inputs_np = np.stack(inputs, axis=0).astype(np.float32)
 
-        # ── target variables ─────────────────────────────────────────────────
-        targets = []
-        for var in self.target_vars:
-            data = self.ds[var].isel(time=time_idx).values.flatten()
-            targets.append(data)
-
-        targets_np = np.stack(targets, axis=0).astype(np.float32)  # (4, H*W)
+        targets_np = np.stack(
+            [self.ds[var].isel(time=time_idx).values.flatten() for var in self.target_vars],
+            axis=0,
+        ).astype(np.float32)
 
         return inputs_np, targets_np
 
@@ -519,13 +696,15 @@ class SeasonalDataLoader:
         if idx < 0 or idx >= len(self):
             raise IndexError(f"Index {idx} out of range [0, {len(self)})")
 
-        combo = self.valid_combinations.iloc[idx]
+        # Use pre-extracted numpy arrays — avoids pandas .iloc overhead
+        number_idx = int(self._vc_number_idx[idx])
+        time_idx   = int(self._vc_time_idx[idx])
         return {
-            "number":     int(combo["number"]),
-            "number_idx": int(combo["number_idx"]),
-            "time_idx":   int(combo["time_idx"]),
-            "lead_month": int(combo["lead_month"]),
-            "time":       self.ds.time.values[int(combo["time_idx"])],
+            "number":     int(self._vc_number[idx]),
+            "number_idx": number_idx,
+            "time_idx":   time_idx,
+            "lead_month": int(self._vc_lead_month[idx]),
+            "time":       self._np_times[time_idx],
         }
 
     def get_indices_by_member_lead(

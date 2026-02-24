@@ -19,7 +19,7 @@ import logging
 import os
 import random
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -143,7 +143,14 @@ def create_year_based_splits(data_loader, train_years, val_years, test_years):
 def setup_distributed(rank, world_size, backend="nccl", local_rank=None):
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "12355")
-    dist.init_process_group(backend, rank=rank, world_size=world_size)
+    # Use a 2-hour timeout so the NCCL watchdog does not fire while rank 0
+    # is loading the ~28 GB dataset into RAM before the first collective.
+    dist.init_process_group(
+        backend,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(hours=2),
+    )
     if torch.cuda.is_available():
         torch.cuda.set_device(rank if local_rank is None else local_rank)
 
@@ -260,7 +267,6 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None,
     # All other names are the same.
     static_vars  = ["dem", "rho", "phi"]
     dynamic_vars = ["tp", "t2m", "tmax", "hurs", "sin_time", "cos_time"]
-    cci_vars     = ["cci_agg"]
     target_vars  = config["model"]["target_vars"]
 
     if config["data"]["normalize"] and rank == 0 and data_loader is not None:
@@ -268,78 +274,79 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None,
         logger.info("FITTING NORMALIZER ON TRAINING DATA (seasonal)")
         logger.info("=" * 70)
 
-        total_samples = len(train_indices)
-        if total_samples == 0:
-            raise ValueError("No training samples found; cannot fit normalizer.")
-
-        sample_size = min(
-            config["data"].get("normalize_samples", 40_000), total_samples
-        )
-        positions     = np.linspace(0, total_samples - 1, sample_size, dtype=int)
-        sample_indices = [train_indices[p] for p in positions]
-
-        var_values = {v: [] for v in static_vars + dynamic_vars + cci_vars + target_vars}
-
-        logger.info(f"Collecting {sample_size:,} samples …")
-        for i, idx in enumerate(sample_indices):
-            if (i + 1) % 500 == 0:
-                logger.info(f"  {i + 1}/{sample_size}")
-            try:
-                inputs, tgts = data_loader[idx]
-
-                # Static: channels 4-6
-                for j, var in enumerate(static_vars):
-                    var_values[var].append(inputs[j + 4].flatten())
-
-                # Dynamic  channels 0-3 → tp, t2m, tmax, hurs
-                #          channels 7-8 → sin_time, cos_time
-                for j, var in enumerate(dynamic_vars):
-                    ch = j if j < 4 else j + 3   # skip static (4,5,6)
-                    var_values[var].append(inputs[ch].flatten())
-
-                # CCI channels 9-18
-                var_values["cci_agg"].append(inputs[9:19].flatten())
-
-                # Targets
-                for j, var in enumerate(target_vars):
-                    var_values[var].append(tgts[j].flatten())
-
-            except Exception as e:
-                logger.warning(f"Error at index {idx}: {e}")
-
-        logger.info("Computing normalization parameters:")
-        logger.info("-" * 60)
-        for var_name, vlist in var_values.items():
-            if not vlist:
-                logger.warning(f"  {var_name}: no data – skipping")
-                continue
-            all_v = np.concatenate(vlist)
-
-            # log1p for precipitation channels
-            if var_name in ("tp", "tpERA"):
-                logger.info(f"  Applying log1p to {var_name}")
-                all_v = np.log1p(np.maximum(all_v, 0))
-
-            method = config["data"]["normalize_method"]
-            if method == "minmax":
-                vmin = float(np.nanmin(all_v))
-                vmax = float(np.nanmax(all_v))
-                if vmax - vmin < 1e-8:
-                    vmax = vmin + 1.0
-                data_loader.scalers[var_name] = {"min": vmin, "max": vmax}
-                logger.info(f"  {var_name:15s}: min={vmin:12.4f}, max={vmax:12.4f}")
-            else:
-                vmean = float(np.nanmean(all_v))
-                vstd  = float(np.nanstd(all_v))
-                if vstd < 1e-8:
-                    vstd = 1.0
-                data_loader.scalers[var_name] = {"mean": vmean, "std": vstd}
-                logger.info(f"  {var_name:15s}: mean={vmean:12.4f}, std={vstd:12.4f}")
-
         norm_path = exp_dir / "normalization_params.json"
-        with open(norm_path, "w") as f:
-            json.dump(data_loader.scalers, f, indent=2)
-        logger.info(f"Normalization params saved → {norm_path}")
+
+        # Load from cache if it already exists (avoids recomputing each run).
+        if norm_path.exists():
+            logger.info(f"Loading cached normalization params from {norm_path}")
+            with open(norm_path) as _f:
+                data_loader.scalers = json.load(_f)
+            logger.info("  ✓ Scalers loaded — skipping recomputation.")
+        else:
+            if not train_indices:
+                raise ValueError("No training samples found; cannot fit normalizer.")
+
+            # Build the set of unique time indices in the training split.
+            train_time_idx = np.unique(data_loader._vc_time_idx[train_indices])
+            logger.info(
+                f"Computing normalization over {len(train_time_idx):,} "
+                f"unique training time steps (from pre-extracted numpy arrays) …"
+            )
+
+            # ── use the already-extracted numpy arrays, not xarray ───────────
+            # data_loader.ds was closed after _extract_numpy_arrays() to free
+            # the file handle.  Going back to xarray would re-read everything
+            # from disk and OOM.  The numpy arrays already hold all the data.
+            method = config["data"]["normalize_method"]
+            t_idx = np.array(train_time_idx, dtype=np.int32)
+
+            def _fit(arr: np.ndarray, var_name: str) -> None:
+                """Store scaler for var_name from a flat numpy array."""
+                if var_name in ("tp", "tpERA"):
+                    arr = np.log1p(np.maximum(arr, 0.0))
+                if method == "minmax":
+                    vmin = float(np.nanmin(arr))
+                    vmax = float(np.nanmax(arr))
+                    if vmax - vmin < 1e-8:
+                        vmax = vmin + 1.0
+                    data_loader.scalers[var_name] = {"min": vmin, "max": vmax}
+                    logger.info(f"  {var_name:15s}: min={vmin:12.4f}  max={vmax:12.4f}")
+                else:
+                    vmean = float(np.nanmean(arr))
+                    vstd  = float(np.nanstd(arr))
+                    if vstd < 1e-8:
+                        vstd = 1.0
+                    data_loader.scalers[var_name] = {"mean": vmean, "std": vstd}
+                    logger.info(f"  {var_name:15s}: mean={vmean:12.4f}  std={vstd:12.4f}")
+
+            logger.info("-" * 60)
+
+            # Forecast vars: _np_fc[var] shape (T, N, H, W) — use all members
+            for var in data_loader.fc_vars:   # tp, t2m, tmax, hurs
+                _fit(data_loader._np_fc[var][t_idx].ravel(), var)
+
+            # Static vars: (H, W) or (T, H, W)
+            for var in data_loader.static_vars:   # dem, rho, phi
+                arr = data_loader._np_static[var]
+                if arr.ndim == 3:
+                    _fit(arr[t_idx].ravel(), var)
+                else:
+                    _fit(arr.ravel(), var)
+
+            # Time-only vars: _np_time[var] shape (T, H, W)
+            for var in data_loader.time_only_vars:   # sin_time, cos_time
+                _fit(data_loader._np_time[var][t_idx].ravel(), var)
+
+            # cci_agg: _np_cci shape (T, n_class, H, W)
+            _fit(data_loader._np_cci[t_idx].ravel(), "cci_agg")
+
+            # Target vars: _np_targets[var] shape (T, H, W)
+            for var in target_vars:
+                _fit(data_loader._np_targets[var][t_idx].ravel(), var)
+
+            with open(norm_path, "w") as f:
+                json.dump(data_loader.scalers, f, indent=2)
+            logger.info(f"Normalization params saved → {norm_path}")
 
     # Broadcast scalers to non-zero ranks
     if world_size > 1:
@@ -386,16 +393,22 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None,
         )
         nw = config["data"].get("num_workers", 4)
         bs = config["training"]["batch_size"]
+        # persistent_workers=True keeps the 12 worker processes alive between
+        # epochs, avoiding the expensive spawn/teardown cycle every epoch.
+        pw = nw > 0
 
         train_loader = DataLoader(train_dataset, batch_size=bs,
                                   sampler=train_sampler,
                                   shuffle=(train_sampler is None),
-                                  num_workers=nw, pin_memory=True, drop_last=True)
+                                  num_workers=nw, pin_memory=True, drop_last=True,
+                                  persistent_workers=pw)
         val_loader   = DataLoader(val_dataset, batch_size=bs,
                                   sampler=val_sampler, shuffle=False,
-                                  num_workers=nw, pin_memory=True)
+                                  num_workers=nw, pin_memory=True,
+                                  persistent_workers=pw)
         test_loader  = DataLoader(test_dataset, batch_size=bs,
-                                  shuffle=False, num_workers=nw, pin_memory=True)
+                                  shuffle=False, num_workers=nw, pin_memory=True,
+                                  persistent_workers=pw)
     else:
         train_loader = val_loader = test_loader = None
 

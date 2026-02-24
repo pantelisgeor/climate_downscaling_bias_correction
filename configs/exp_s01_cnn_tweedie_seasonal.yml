@@ -31,13 +31,13 @@ experiment:
 seed: 42
 
 data:
-  nc_path: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models/preprocessed_data/Seasonal_all_leads/training_data.nc"
+  nc_path: "/nvme/h/pgeorgiades/scratch/training_seasonal.nc"
   cache_dir: "./cache"
   load_in_memory: true
   rank0_only_in_memory_load: true
   rank0_batch_broadcast: false
   normalize: true
-  normalize_samples: 60000
+  normalize_samples: null   # null = use all training samples
   normalize_method: "minmax"
   # ── year splits (matches existing seasonal UNet params.json) ─────────────
   train_years: [1981, 1982, 1983, 1984, 1985, 1986, 1987, 1988, 1989,
