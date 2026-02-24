@@ -1,0 +1,157 @@
+# exp_13_cnn_tweedie_dwa.yml
+# ──────────────────────────────────────────────────────────────────────────────
+# EXPERIMENT 13 — Tweedie deviance (p=1.5) + Dynamic Weight Average (DWA)
+#
+# Context — what exp_11 (p=1.5, equal task weighting) told us:
+#   The Tweedie loss at p=1.5 produced a good spatial distribution and correct
+#   intensities up to ~100mm.  The >100mm tail is still underestimated.
+#
+# Different diagnosis from exp_12 — task competition, not loss shape:
+#   exp_12 addresses the upper-tail problem by modifying the LOSS FUNCTION
+#   (p=1.5 → 1.8).  exp_13 attacks the same symptom from an orthogonal angle:
+#   the TASK WEIGHTING scheme.
+#
+#   With equal weighting, the total gradient is:
+#       G = (L_tas + L_tasmax + L_tpERA + L_rh) / 4
+#   Temperature and humidity variables are better-conditioned: they converge
+#   faster and hold stable, low losses throughout training.  In later epochs,
+#   the denominator of the precipitation gradient (the total loss magnitude)
+#   is dominated by T/RH progress, effectively shrinking the relative step
+#   size for tpERA — even though the Tweedie loss for tpERA is still large
+#   and decreasing slowly.  The model sees T/RH dominating the overall signal
+#   and the tpERA tail does not receive sufficient gradient.
+#
+# Fix: Dynamic Weight Average (DWA) — Liu et al. (2019)
+#   DWA computes per-task weights at each epoch based on the RATE OF CHANGE
+#   of each task's loss:
+#       w_k(t) ∝ exp( r_k(t-1) / T )    where r_k = L_k(t-1) / avg[L_k(t-2..t-w)]
+#   Tasks whose loss is DECREASING SLOWLY (high r_k) receive HIGHER weight.
+#   Tasks that have already converged (low r_k) contribute less.
+#
+#   For this experiment:
+#     • T and RH losses converge quickly → their r_k drops → their weights
+#       decrease automatically after the first ~10 epochs.
+#     • tpERA (Tweedie tail) converges more slowly → r_k stays elevated →
+#       DWA pushes more gradient signal toward precipitation as training
+#       progresses — exactly when the model needs to fine-tune the heavy tail.
+#
+#   This is the minimal multi-task fix because:
+#     (a) it requires no loss-function change (Tweedie p=1.5 kept, already good
+#         for <100mm),
+#     (b) it is data-driven: the schedule adapts to the actual convergence
+#         profile of this dataset rather than using a fixed rule, and
+#     (c) it cannot degrade T/RH performance because DWA preserves relative
+#         weighting — fast-converging tasks are down-weighted, not ignored.
+#
+# Comparison with exp_12:
+#   • exp_12 (p=1.8): stronger Tweedie gradient for ALL wet events, but risks
+#     over-shooting dry-day zero-mass if p is too high.  Good diagnostic if
+#     the loss shape was the bottleneck.
+#   • exp_13 (DWA):   keeps the proven p=1.5 balance, instead letting the
+#     multi-task schedule devote more capacity to precipitation in the epochs
+#     where it still has room to improve.  Good diagnostic if task competition
+#     was the bottleneck.
+#
+# All other hyperparameters identical to exp_11.
+# ──────────────────────────────────────────────────────────────────────────────
+
+experiment:
+  name: "cnn_tweedie_dwa"
+  base_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments"
+  output_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments/exp_13_cnn_tweedie_dwa"
+  description: "Tweedie deviance (p=1.5) + DWA task weighting — redirects gradient to tpERA when it converges slower than T/RH"
+
+seed: 42
+
+data:
+  nc_path: "/nvme/h/pgeorgiades/scratch/full_dataset.nc"
+  cache_dir: "./cache"
+  load_in_memory: true
+  rank0_only_in_memory_load: true
+  rank0_batch_broadcast: false
+  normalize: true
+  normalize_samples: 100000
+  normalize_method: "minmax"
+  train_years: [1981, 1982, 1983, 1984, 1985, 1986, 1987, 1988, 1989,
+                1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999,
+                2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009,
+                2010, 2011, 2012]
+  val_years: [2013, 2014, 2015, 2016]
+  test_years: [2017, 2018, 2019, 2020]
+  num_workers: 12
+
+model:
+  static_channels: 3          # dem, rho, phi
+  dynamic_channels: 16        # pr, tas, tasmax, hurs, sin_t, cos_t, cci×10
+  image_size: [35, 77]
+  encoder_type: "cnn"
+  encoder_dim: 512
+  encoder_blocks: 5
+  decoder_type: "multi"
+  decoder_hidden_dims: [512, 256, 128, 64]
+  target_vars: ["tasERA", "tasmaxERA", "tpERA", "rhERA"]
+  output_activations:
+    tpERA: "softplus"          # ensures mu > 0, required by Tweedie
+  use_film: true
+  num_leads: 11
+  lead_embed_dim: 128
+
+optimizer:
+  type: "adamw"
+  lr: !!float 1e-5
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+scheduler:
+  type: "cosine"
+  min_lr: !!float 1e-7
+  factor: 0.5
+  patience: 5
+  step_size: 30
+  gamma: 0.1
+
+training:
+  batch_size: 200
+  max_epochs: 100
+  stage1_epochs: 50
+  gradient_clip_val: 1.0      # same as exp_11: p=1.5 does not require tighter clip
+  early_stopping_patience: 15
+  save_every_n_epochs: 5
+  val_interval: 1
+  use_amp: true
+  device: "cuda"
+
+loss:
+  weighting_strategy: dwa          # ← KEY CHANGE: equal → dwa
+                                   #   DWA boosts tpERA weight automatically when
+                                   #   its loss decreases slower than T/RH losses
+  data_loss_types:
+    tasERA: hybrid
+    tasmaxERA: hybrid
+    tpERA: tweedie                 # Tweedie p=1.5, identical to exp_11
+    rhERA: hybrid
+  # Tweedie params for tpERA (unchanged from exp_11)
+  tweedie_power: 1.5               # compound Poisson-Gamma midpoint (1 < p < 2)
+  tweedie_eps: !!float 1e-6        # mu lower clamp to prevent log(0)
+  # compositedry / wethybrid params kept but unused for tpERA
+  compositedry_gamma: 1.0
+  compositedry_overestimate_weight: 2.5
+  compositedry_dry_threshold: 0.002
+  compositedry_lambda_extreme: 1.0
+  compositedry_lambda_dry: 0.7
+  wet_weight: 10.0
+  dry_weight: 1.0
+  use_physics: false
+  physics_weight: 0.0
+  use_clausius_clapeyron: false
+  use_temp_consistency: false
+  use_humidity_bounds: false
+  use_precip_nonnegativity: false
+  use_spatial_smoothness: false
+
+logging:
+  log_level: "INFO"
+  log_interval: 50
+
+evaluation:
+  save_predictions: true

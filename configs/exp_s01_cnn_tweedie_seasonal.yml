@@ -1,0 +1,123 @@
+# exp_s01_cnn_tweedie_seasonal.yml
+# ──────────────────────────────────────────────────────────────────────────────
+# EXPERIMENT S01 — Seasonal forecast bias-correction with Tweedie loss (p=1.5)
+#
+# This is the seasonal-data analogue of exp_11 (decadal Tweedie).
+#
+# Dataset differences from the decadal pipeline:
+#   • NetCDF dims:  time × number (25 ensemble members) × latitude × longitude
+#   • Forecast variable names: tp, t2m, tmax, hurs  (not pr, tas, tasmax, hurs)
+#   • Lead time:  integer months 0–6 derived from the lead_time(time,number,…)
+#                 timedelta64 variable
+#   • Grid size:  28 lat × 53 lon
+#   • tp stored with WRONG dimension order (number,lat,lon,time) in the source
+#     file — SeasonalDataLoader automatically transposes it.
+#
+# Year splits taken from the existing UNet_Attention_extremedry/params.json:
+#   train : 1981–2013
+#   val   : 2014–2016
+#   test  : 2017–2019
+#
+# All other modelling choices (architecture, loss, optimiser, scheduler) are
+# identical to exp_11 so results are directly comparable.
+# ──────────────────────────────────────────────────────────────────────────────
+
+experiment:
+  name: "cnn_tweedie_seasonal"
+  base_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments"
+  output_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments_seasonal/exp_s01_cnn_tweedie_seasonal"
+  description: "Seasonal bias-correction — Tweedie deviance (p=1.5) for tpERA, CNN encoder"
+
+seed: 42
+
+data:
+  nc_path: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models/preprocessed_data/Seasonal_all_leads/training_data.nc"
+  cache_dir: "./cache"
+  load_in_memory: true
+  rank0_only_in_memory_load: true
+  rank0_batch_broadcast: false
+  normalize: true
+  normalize_samples: 60000
+  normalize_method: "minmax"
+  # ── year splits (matches existing seasonal UNet params.json) ─────────────
+  train_years: [1981, 1982, 1983, 1984, 1985, 1986, 1987, 1988, 1989,
+                1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999,
+                2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009,
+                2010, 2011, 2012, 2013]
+  val_years:   [2014, 2015, 2016]
+  test_years:  [2017, 2018, 2019, 2020]
+  num_workers: 12
+
+model:
+  static_channels: 3          # dem, rho, phi
+  dynamic_channels: 16        # tp, t2m, tmax, hurs, sin_t, cos_t, cci×10
+  image_size: [28, 53]        # seasonal grid: 28 lat × 53 lon
+  encoder_type: "cnn"
+  encoder_dim: 512
+  encoder_blocks: 5
+  decoder_type: "multi"
+  decoder_hidden_dims: [512, 256, 128, 64]
+  target_vars: ["tasERA", "tasmaxERA", "tpERA", "rhERA"]
+  output_activations:
+    tpERA: "softplus"         # ensures mu > 0, required by Tweedie
+  use_film: true
+  num_leads: 7                # lead months 0, 1, 2, 3, 4, 5, 6
+  lead_embed_dim: 128
+
+optimizer:
+  type: "adamw"
+  lr: !!float 1e-5
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+scheduler:
+  type: "cosine"
+  min_lr: !!float 1e-7
+  factor: 0.5
+  patience: 5
+  step_size: 30
+  gamma: 0.1
+
+training:
+  batch_size: 200
+  max_epochs: 100
+  stage1_epochs: 50
+  gradient_clip_val: 1.0
+  early_stopping_patience: 15
+  save_every_n_epochs: 5
+  val_interval: 1
+  use_amp: true
+  device: "cuda"
+
+loss:
+  weighting_strategy: equal
+  data_loss_types:
+    tasERA:    hybrid
+    tasmaxERA: hybrid
+    tpERA:     tweedie         # Tweedie deviance (compound Poisson-Gamma MLE)
+    rhERA:     hybrid
+  # Tweedie params
+  tweedie_power: 1.5           # midpoint between Poisson (1) and Gamma (2)
+  tweedie_eps: !!float 1e-6
+  # compositedry / wethybrid params kept but unused for tpERA
+  compositedry_gamma: 1.0
+  compositedry_overestimate_weight: 2.5
+  compositedry_dry_threshold: 0.002
+  compositedry_lambda_extreme: 1.0
+  compositedry_lambda_dry: 0.7
+  wet_weight: 10.0
+  dry_weight: 1.0
+  use_physics: false
+  physics_weight: 0.0
+  use_clausius_clapeyron: false
+  use_temp_consistency: false
+  use_humidity_bounds: false
+  use_precip_nonnegativity: false
+  use_spatial_smoothness: false
+
+logging:
+  log_level: "INFO"
+  log_interval: 50
+
+evaluation:
+  save_predictions: true

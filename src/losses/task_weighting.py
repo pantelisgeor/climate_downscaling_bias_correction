@@ -140,19 +140,43 @@ class DynamicWeightAverage(nn.Module):
         self.temperature = temperature
         self.window_size = window_size
 
-        # Store loss history
+        # Store epoch-level loss history (updated once per epoch via end_of_epoch)
         self.loss_history = {task: [] for task in task_names}
 
-    def update_history(self, task_losses: Dict[str, torch.Tensor]):
-        """Update loss history."""
-        for task in self.task_names:
-            if task in task_losses:
-                loss_val = task_losses[task].item()
-                self.loss_history[task].append(loss_val)
+        # Weights applied during the current epoch (set at end of previous epoch)
+        self._current_weights: Dict[str, float] = {task: 1.0 for task in task_names}
 
-                # Keep only recent history
+        # Batch-level accumulators for computing epoch-average losses
+        self._batch_loss_sums: Dict[str, float] = {task: 0.0 for task in task_names}
+        self._batch_loss_counts: Dict[str, int] = {task: 0 for task in task_names}
+
+    def update_history(self, epoch_avg_losses: Dict[str, float]):
+        """Update epoch-level loss history. Called once per epoch by end_of_epoch()."""
+        for task in self.task_names:
+            if task in epoch_avg_losses:
+                self.loss_history[task].append(epoch_avg_losses[task])
+
+                # Keep only the entries needed (window_size previous + 1 current)
                 if len(self.loss_history[task]) > self.window_size + 1:
                     self.loss_history[task].pop(0)
+
+    def end_of_epoch(self):
+        """
+        Compute epoch-average losses from batch accumulators, update the
+        loss history, recompute DWA weights, and reset accumulators.
+
+        Must be called once after every training epoch (before the next).
+        """
+        epoch_avgs = {
+            task: (self._batch_loss_sums[task] / max(self._batch_loss_counts[task], 1))
+            for task in self.task_names
+        }
+        self.update_history(epoch_avgs)
+        self._current_weights = self.compute_weights()
+
+        # Reset accumulators for the next epoch
+        self._batch_loss_sums = {task: 0.0 for task in self.task_names}
+        self._batch_loss_counts = {task: 0 for task in self.task_names}
 
     def compute_weights(self) -> Dict[str, float]:
         """
@@ -185,9 +209,17 @@ class DynamicWeightAverage(nn.Module):
 
         return {task: weights[i].item() for i, task in enumerate(self.task_names)}
 
+    def get_weights(self) -> Dict[str, float]:
+        """Return the weights that are currently active for this epoch."""
+        return dict(self._current_weights)
+
     def forward(self, task_losses: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         Compute weighted losses using DWA.
+
+        Weights are fixed for the whole epoch (set by the previous call to
+        end_of_epoch).  Batch losses are accumulated here so that end_of_epoch
+        can compute the epoch average and update weights for the NEXT epoch.
 
         Args:
             task_losses: Dictionary mapping task names to loss values
@@ -195,13 +227,14 @@ class DynamicWeightAverage(nn.Module):
         Returns:
             Tuple of (weighted_losses dict, weights dict)
         """
-        # Update history
-        self.update_history(task_losses)
+        # Accumulate batch losses for end-of-epoch averaging
+        for task in self.task_names:
+            if task in task_losses:
+                self._batch_loss_sums[task] += task_losses[task].item()
+                self._batch_loss_counts[task] += 1
 
-        # Get current weights
-        weights = self.compute_weights()
-
-        # Apply weights
+        # Apply the weights that were fixed at the start of this epoch
+        weights = self._current_weights
         weighted_losses = {}
         total_loss = 0.0
 
@@ -311,6 +344,12 @@ class CombinedLoss(nn.Module):
         tweedie_eps: float = 1e-6,
         wet_weight: float = 5.0,
         dry_weight: float = 1.0,
+        # compositedry params
+        compositedry_gamma: float = 1.0,
+        compositedry_overestimate_weight: float = 2.5,
+        compositedry_dry_threshold: float = 0.002,
+        compositedry_lambda_extreme: float = 1.0,
+        compositedry_lambda_dry: float = 0.7,
         **kwargs,
     ):
         """
@@ -328,6 +367,11 @@ class CombinedLoss(nn.Module):
                         when using 'wethybrid' loss type.
             dry_weight: Weight for dry (zero) precipitation pixels in
                         'wethybrid' loss.
+            compositedry_gamma: Focal exponent for 'compositedry' loss.
+            compositedry_overestimate_weight: Multiplier for dry-day over-predictions.
+            compositedry_dry_threshold: Denormalised dry threshold (default 0.002).
+            compositedry_lambda_extreme: Weight of focal MAE term.
+            compositedry_lambda_dry: Weight of dry asymmetric penalty term.
             **kwargs: Additional arguments forwarded to PhysicsInformedLoss
         """
         super().__init__()
@@ -347,6 +391,11 @@ class CombinedLoss(nn.Module):
             tweedie_eps=tweedie_eps,
             wet_weight=wet_weight,
             dry_weight=dry_weight,
+            compositedry_gamma=compositedry_gamma,
+            compositedry_overestimate_weight=compositedry_overestimate_weight,
+            compositedry_dry_threshold=compositedry_dry_threshold,
+            compositedry_lambda_extreme=compositedry_lambda_extreme,
+            compositedry_lambda_dry=compositedry_lambda_dry,
         )
 
         # Physics loss

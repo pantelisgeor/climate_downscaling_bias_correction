@@ -645,6 +645,14 @@ class Trainer:
                 # Train
                 train_losses = self.train_epoch(epoch, stage=stage)
 
+                # Update DWA weights using the epoch-averaged losses just collected
+                if (
+                    hasattr(self.loss_fn, "task_weighting")
+                    and self.loss_fn.task_weighting is not None
+                    and hasattr(self.loss_fn.task_weighting, "end_of_epoch")
+                ):
+                    self.loss_fn.task_weighting.end_of_epoch()
+
                 # Validate
                 if epoch % self.val_interval == 0:
                     val_losses = self.validate(epoch)

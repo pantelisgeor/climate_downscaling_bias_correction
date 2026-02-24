@@ -2,7 +2,7 @@
 Loss functions module.
 """
 
-from .data_losses import MSELoss, MAELoss, HybridLoss, WetDayHybridLoss, MultiVariableDataLoss
+from .data_losses import MSELoss, MAELoss, HybridLoss, WetDayHybridLoss, CompositeExtremeDryLoss, MultiVariableDataLoss
 from .physics_losses import (
     ClauisiusClapeyronLoss,
     TemperatureConsistencyLoss,
@@ -23,6 +23,7 @@ __all__ = [
     'MAELoss',
     'HybridLoss',
     'WetDayHybridLoss',
+    'CompositeExtremeDryLoss',
     'MultiVariableDataLoss',
     'ClauisiusClapeyronLoss',
     'TemperatureConsistencyLoss',

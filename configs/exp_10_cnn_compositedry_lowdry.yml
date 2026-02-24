@@ -1,22 +1,35 @@
-# exp_02_cnn_physics.yml
+# exp_10_cnn_compositedry_lowdry.yml
 # ──────────────────────────────────────────────────────────────────────────────
-# EXPERIMENT 02 — CNN + physics losses (ablation: effect of physics constraints)
-# Purpose : Identical to exp_01 except physics losses are enabled in stage 2
-#           (epochs 51-100). Physics losses now operate in physical units
-#           (denormalised internally) following the recent PhysicsInformedLoss
-#           rewrite.
-# Key differences vs exp_01:
-#   - use_physics: true
-#   - CC law, temp consistency, humidity bounds all active
-#   - physics_weight: 0.02  (empirically best from baseline history; 0.2 caused
-#                            spatial distortions in default_7/8)
+# EXPERIMENT 10 — CompositeExtremeDryLoss with reduced dry penalty (lambda_dry=0.2)
+#
+# When to run: exp_08 (lambda_dry=0.7) under-predicts but does NOT show
+# significant false drizzle — the model is being too conservative because the
+# dry penalty is discouraging it from predicting rain at all.
+#
+# Change vs exp_08:
+#   compositedry_lambda_dry: 0.7 → 0.2
+#
+# Effect:
+#   The asymmetric penalty on dry-day over-predictions contributes only 0.2×
+#   its previous magnitude.  The focal MAE term now dominates almost entirely.
+#   Without the strong dry-penalty "brake", the model is free to predict non-
+#   zero precipitation more aggressively, which should shift the distribution
+#   rightward toward observed wet-day intensities.
+#
+#   Trade-off: may reintroduce some false drizzle (over-predicting on dry days).
+#   Monitor dry-day false-alarm rate in the Q-Q plots from analyze_inference_outputs.py.
+#   If drizzle reappears, the right balance lies between exp_08 (0.7) and this (0.2),
+#   e.g. lambda_dry=0.4.
+#
+# gamma=1.0 kept the same as exp_08 to isolate the lambda_dry effect.
+# All other hyperparameters identical to exp_08.
 # ──────────────────────────────────────────────────────────────────────────────
 
 experiment:
-  name: "cnn_physics"
+  name: "cnn_compositedry_lowdry"
   base_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments"
-  output_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments/exp_02_cnn_physics"
-  description: "CNN multi-decoder, wethybrid, physics ON (weight=0.02) — ablate physics benefit"
+  output_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments/exp_10_cnn_compositedry_lowdry"
+  description: "CompositeExtremeDryLoss with lambda_dry=0.2 — softer dry brake, more aggressive wet-day prediction"
 
 seed: 42
 
@@ -70,7 +83,7 @@ scheduler:
 training:
   batch_size: 256
   max_epochs: 100
-  stage1_epochs: 50           # data-loss only for first 50 epochs
+  stage1_epochs: 50
   gradient_clip_val: 1.0
   early_stopping_patience: 15
   save_every_n_epochs: 5
@@ -83,18 +96,21 @@ loss:
   data_loss_types:
     tasERA: hybrid
     tasmaxERA: hybrid
-    tpERA: wethybrid
+    tpERA: compositedry
     rhERA: hybrid
-  wet_weight: 5.0
+  compositedry_gamma: 1.0                # same as exp_08 — isolates lambda_dry effect
+  compositedry_overestimate_weight: 2.5
+  compositedry_dry_threshold: 0.002
+  compositedry_lambda_extreme: 1.0
+  compositedry_lambda_dry: 0.2           # ← KEY CHANGE: soft dry brake (was 0.7 in exp_08)
+  wet_weight: 10.0
   dry_weight: 1.0
-  # Physics ON — added in stage 2 (after stage1_epochs)
-  use_physics: true
-  physics_weight: 0.02        # 0.02 keeps physical plausibility without
-                              # dominating data loss (0.2 caused artefacts)
-  use_clausius_clapeyron: true
-  use_temp_consistency: true
-  use_humidity_bounds: true
-  use_precip_nonnegativity: false  # always near-zero with softplus; skip for efficiency
+  use_physics: false
+  physics_weight: 0.0
+  use_clausius_clapeyron: false
+  use_temp_consistency: false
+  use_humidity_bounds: false
+  use_precip_nonnegativity: false
   use_spatial_smoothness: false
 
 logging:

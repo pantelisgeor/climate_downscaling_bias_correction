@@ -98,7 +98,7 @@ loss:
     tasmaxERA: hybrid
     tpERA: wethybrid
     rhERA: hybrid
-  wet_weight: 5.0
+  wet_weight: 10.0
   dry_weight: 1.0
   use_physics: false
   physics_weight: 0.0

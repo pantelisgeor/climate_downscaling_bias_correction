@@ -1,20 +1,31 @@
-# exp_03_cnn_shared.yml
+# exp_09_cnn_compositedry_gamma2.yml
 # ──────────────────────────────────────────────────────────────────────────────
-# EXPERIMENT 03 — CNN + shared decoder (ablation: decoder architecture)
-# Purpose : Test whether a single shared trunk (4-channel output, per-var
-#           activations) outperforms four independent decoder heads (exp_01).
-#           Shared decoder has fewer parameters but forces the model to produce
-#           all 4 outputs jointly in the same feature space; potentially better
-#           for physically correlated variables (tas/tasmax/rh).
-# Key differences vs exp_01:
-#   - decoder_type: "shared"
+# EXPERIMENT 09 — CompositeExtremeDryLoss with gamma=2.0 (cubic focal term)
+#
+# When to run: exp_08 (gamma=1.0) still under-predicts heavy-rain events.
+#
+# Change vs exp_08:
+#   compositedry_gamma: 1.0 → 2.0
+#
+# Effect:
+#   The focal weight becomes  error^2  (vs error^1 in exp_08), so the combined
+#   loss on each pixel is  error^2 × error = error^3.  This is substantially
+#   more aggressive: an error of 0.5 (normalised) gets 4× the weight it would
+#   under exp_08; an error of 0.1 gets about the same.  The gradient signal
+#   becomes even more dominated by the hardest (most under-predicted) examples.
+#
+#   Trade-off: increased risk of training instability if a few outlier pixels
+#   dominate early batches — watch the tpERA loss curve for spikes.
+#   gradient_clip_val=1.0 provides the safety net.
+#
+# All other hyperparameters identical to exp_08.
 # ──────────────────────────────────────────────────────────────────────────────
 
 experiment:
-  name: "cnn_shared"
+  name: "cnn_compositedry_gamma2"
   base_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments"
-  output_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments/exp_03_cnn_shared"
-  description: "CNN shared-decoder, wethybrid, no physics — ablate decoder architecture"
+  output_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments/exp_09_cnn_compositedry_gamma2"
+  description: "CompositeExtremeDryLoss with gamma=2.0 (error³ focal) — aggressive extreme boosting"
 
 seed: 42
 
@@ -42,7 +53,7 @@ model:
   encoder_type: "cnn"
   encoder_dim: 512
   encoder_blocks: 5
-  decoder_type: "shared"      # single trunk → 4-channel output (vs "multi")
+  decoder_type: "multi"
   decoder_hidden_dims: [512, 256, 128, 64]
   target_vars: ["tasERA", "tasmaxERA", "tpERA", "rhERA"]
   output_activations:
@@ -81,8 +92,13 @@ loss:
   data_loss_types:
     tasERA: hybrid
     tasmaxERA: hybrid
-    tpERA: wethybrid
+    tpERA: compositedry
     rhERA: hybrid
+  compositedry_gamma: 2.0                # ← KEY CHANGE: error³ focal (was 1.0 in exp_08)
+  compositedry_overestimate_weight: 2.5
+  compositedry_dry_threshold: 0.002
+  compositedry_lambda_extreme: 1.0
+  compositedry_lambda_dry: 0.7           # same dry penalty as exp_08
   wet_weight: 10.0
   dry_weight: 1.0
   use_physics: false

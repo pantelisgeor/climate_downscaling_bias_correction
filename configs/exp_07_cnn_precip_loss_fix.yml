@@ -1,20 +1,31 @@
-# exp_03_cnn_shared.yml
+# exp_07_cnn_precip_loss_fix.yml
 # ──────────────────────────────────────────────────────────────────────────────
-# EXPERIMENT 03 — CNN + shared decoder (ablation: decoder architecture)
-# Purpose : Test whether a single shared trunk (4-channel output, per-var
-#           activations) outperforms four independent decoder heads (exp_01).
-#           Shared decoder has fewer parameters but forces the model to produce
-#           all 4 outputs jointly in the same feature space; potentially better
-#           for physically correlated variables (tas/tasmax/rh).
-# Key differences vs exp_01:
-#   - decoder_type: "shared"
+# EXPERIMENT 07 — CNN baseline with corrected WetDayHybridLoss
+#
+# Root-cause of under-prediction in exp_01 (loss math was wrong):
+#   WetDayHybridLoss previously computed:
+#       loss = (wet_weight × wet_pixels + dry_weight × dry_pixels).mean()
+#   The global .mean() divides by ALL pixels (wet + dry combined). With Cyprus
+#   having ~85% dry days, wet_weight=5 gave wet pixels only ~47% of gradient
+#   signal — scarcely better than plain hybrid loss.
+#
+# Fix applied to src/losses/data_losses.py:
+#   Compute mean WITHIN each regime independently, then combine:
+#       loss = wet_weight × mean(wet_pixels) + dry_weight × mean(dry_pixels)
+#   Now wet_weight=10 truly means: every wet pixel's average error counts
+#   10× the average dry pixel error, regardless of the wet/dry ratio.
+#
+# Changes vs exp_01:
+#   - WetDayHybridLoss fix (code-level, affects all wethybrid experiments)
+#   - wet_weight: 5.0 → 10.0  (stronger gradient on precipitation events)
+#   - all other hyperparameters identical to exp_01
 # ──────────────────────────────────────────────────────────────────────────────
 
 experiment:
-  name: "cnn_shared"
+  name: "cnn_precip_loss_fix"
   base_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments"
-  output_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments/exp_03_cnn_shared"
-  description: "CNN shared-decoder, wethybrid, no physics — ablate decoder architecture"
+  output_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments/exp_07_cnn_precip_loss_fix"
+  description: "CNN baseline with corrected per-regime WetDayHybridLoss and wet_weight=10"
 
 seed: 42
 
@@ -36,13 +47,13 @@ data:
   num_workers: 12
 
 model:
-  static_channels: 3
-  dynamic_channels: 16
+  static_channels: 3          # dem, rho, phi
+  dynamic_channels: 16        # pr, tas, tasmax, hurs, sin_t, cos_t, cci×10
   image_size: [35, 77]
   encoder_type: "cnn"
   encoder_dim: 512
   encoder_blocks: 5
-  decoder_type: "shared"      # single trunk → 4-channel output (vs "multi")
+  decoder_type: "multi"
   decoder_hidden_dims: [512, 256, 128, 64]
   target_vars: ["tasERA", "tasmaxERA", "tpERA", "rhERA"]
   output_activations:
@@ -81,8 +92,10 @@ loss:
   data_loss_types:
     tasERA: hybrid
     tasmaxERA: hybrid
-    tpERA: wethybrid
+    tpERA: wethybrid           # now uses corrected per-regime averaging
     rhERA: hybrid
+  # wet_weight=10 with corrected loss: each wet pixel's mean error counts 10×
+  # the mean dry-pixel error — meaningful signal even at 85% dry-day frequency.
   wet_weight: 10.0
   dry_weight: 1.0
   use_physics: false

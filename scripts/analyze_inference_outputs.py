@@ -513,6 +513,75 @@ def create_scatter_plots(collated: xr.Dataset, output_dir: Path, dpi: int = 200)
         plt.close(fig)
 
 
+def create_qq_plots(collated: xr.Dataset, output_dir: Path, n_quantiles: int = 500, dpi: int = 200) -> None:
+    """Q-Q plots of input-vs-target and prediction-vs-target on one shared axis.
+
+    For each variable a single figure is produced with one panel per variable.
+    Both curves share the same x-axis (target quantiles); the input quantiles are
+    drawn in orange and the prediction quantiles in blue.  A black dashed 1:1
+    reference line marks perfect agreement.
+
+    For precipitation the zero-inflated distribution is handled by computing
+    quantiles over *all* values (including zeros) so that the departure of the
+    model from the target is visible across the full CDF.
+    """
+    qq_dir = output_dir / "qq_plots"
+    qq_dir.mkdir(parents=True, exist_ok=True)
+
+    probs = np.linspace(0.0, 100.0, n_quantiles)
+
+    for key, cfg in VAR_CONFIG.items():
+        input_name = f"{key}_input_monthly"
+        target_name = f"{key}_target_monthly"
+        pred_name = f"{key}_pred_monthly"
+
+        target = collated[target_name].values.ravel()
+        inp = collated[input_name].values.ravel()
+        pred = collated[pred_name].values.ravel()
+
+        # Build a common finite mask across all three fields
+        mask = np.isfinite(target) & np.isfinite(inp) & np.isfinite(pred)
+        if mask.sum() < 10:
+            continue
+
+        tgt_q = np.percentile(target[mask], probs)
+        inp_q = np.percentile(inp[mask], probs)
+        pred_q = np.percentile(pred[mask], probs)
+
+        # Axis limits: span all three distributions
+        all_vals = np.concatenate([tgt_q, inp_q, pred_q])
+        lo, hi = float(np.nanmin(all_vals)), float(np.nanmax(all_vals))
+        pad = (hi - lo) * 0.03
+        lo -= pad
+        hi += pad
+
+        fig, ax = plt.subplots(figsize=(7, 6), constrained_layout=True)
+
+        ax.plot(
+            tgt_q, inp_q,
+            color="tab:orange", linewidth=1.5, label="Input vs Target",
+        )
+        ax.plot(
+            tgt_q, pred_q,
+            color="tab:blue", linewidth=1.5, label="Prediction vs Target",
+        )
+        # 1:1 reference line
+        ax.plot([lo, hi], [lo, hi], "k--", linewidth=1.0, label="1:1 (perfect)")
+
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel(f"Target quantiles ({cfg['units']})")
+        ax.set_ylabel(f"Field quantiles ({cfg['units']})")
+        ax.set_title(f"Q-Q plot: {cfg['label']}")
+        ax.legend(framealpha=0.85)
+        ax.grid(alpha=0.3)
+
+        out_path = qq_dir / f"{key}_qq.png"
+        fig.savefig(out_path, dpi=dpi)
+        plt.close(fig)
+
+
 def _stats_for_taylor(target: np.ndarray, field: np.ndarray) -> Tuple[float, float]:
     mask = np.isfinite(target) & np.isfinite(field)
     t = target[mask]
@@ -634,6 +703,9 @@ def main() -> None:
 
     create_taylor_diagrams(collated, output_dir=output_dir, dpi=args.dpi)
     print(f"Saved Taylor diagrams in: {output_dir / 'taylor'}")
+
+    create_qq_plots(collated, output_dir=output_dir, dpi=args.dpi)
+    print(f"Saved Q-Q plots in: {output_dir / 'qq_plots'}")
 
 if __name__ == "__main__":
     main()

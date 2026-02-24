@@ -691,6 +691,12 @@ def main(
         # Wet-day weighting for precipitation (wethybrid loss type)
         wet_weight=config["loss"].get("wet_weight", 5.0),
         dry_weight=config["loss"].get("dry_weight", 1.0),
+        # Focal MAE + asymmetric dry penalty (compositedry loss type)
+        compositedry_gamma=config["loss"].get("compositedry_gamma", 1.0),
+        compositedry_overestimate_weight=config["loss"].get("compositedry_overestimate_weight", 2.5),
+        compositedry_dry_threshold=config["loss"].get("compositedry_dry_threshold", 0.002),
+        compositedry_lambda_extreme=config["loss"].get("compositedry_lambda_extreme", 1.0),
+        compositedry_lambda_dry=config["loss"].get("compositedry_lambda_dry", 0.7),
         # Pass scaler info so PhysicsInformedLoss can work in physical units
         scalers=data_loader.scalers,
         normalize_method=config["data"].get("normalize_method", "minmax"),

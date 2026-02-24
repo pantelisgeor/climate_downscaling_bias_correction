@@ -1,0 +1,146 @@
+# exp_11_cnn_tweedie_precip.yml
+# ──────────────────────────────────────────────────────────────────────────────
+# EXPERIMENT 11 — Tweedie deviance loss for tpERA
+#
+# Context — why exp_08 still under-predicts (and why exp_09/10 may not be enough):
+#   exp_08–10 all use variants of CompositeExtremeDryLoss, which is a
+#   focal-MAE heuristic.  The focal term re-weights existing errors but the
+#   loss still measures a pixel-wise distance in normalised space, without
+#   any knowledge of the precipitation distribution shape.
+#
+# Tweedie deviance: a principled MLE approach
+#   Precipitation is well-described by a compound Poisson-Gamma distribution:
+#     • Many pixels are exactly zero (dry days)        → Poisson component (p→1)
+#     • Non-zero amounts are heavy-tailed and positive  → Gamma component (p→2)
+#   The Tweedie family with  1 < p < 2  unifies both in a single distribution
+#   whose negative log-likelihood is the Tweedie deviance:
+#
+#     D(y, mu) = 2 * [ y^(2-p)/((1-p)(2-p))  -  y*mu^(1-p)/(1-p)  +  mu^(2-p)/(2-p) ]
+#
+#   Minimising D(y, mu) is equivalent to maximum likelihood estimation under
+#   the Tweedie distribution.  Unlike MSE/MAE/focal-MAE, the gradient of D
+#   w.r.t. mu is  (mu^(1-p) - y*mu^(-p)), which is asymmetric: under-
+#   predictions (mu < y) of large events produce disproportionately large
+#   gradients because  mu^(-p) blows up as mu → 0.  This is the statistical
+#   mechanism that corrects systematic underestimation.
+#
+# Choice of power = 1.5 (midpoint):
+#   p=1.5 sits midway between Poisson (p=1) and Gamma (p=2) and is the most
+#   commonly used value in precipitation modelling literature.  It grants equal
+#   "respect" to the zero mass and the positive tail.  If the model still
+#   underestimates after this experiment, increasing p toward 1.8 would shift
+#   focus further onto the continuous wet-day tail.
+#
+# Differences vs exp_08:
+#   - tpERA loss: compositedry → tweedie
+#   - tweedie_power: 1.5  (new param)
+#   - tweedie_eps:   1e-6 (default)
+#   All other hyperparameters identical to exp_08.
+#
+# What to watch:
+#   • tpERA val loss should decrease more reliably as the network learns the
+#     correct conditional distribution shape.
+#   • Check Q-Q plots from analyze_inference_outputs.py: the right tail
+#     (heavy-rain days) should align better with observations.
+#   • If dry-day false-alarm rate increases, the Tweedie power can be reduced
+#     slightly toward 1.2 in a follow-up to strengthen the Poisson-zero mass.
+# ──────────────────────────────────────────────────────────────────────────────
+
+experiment:
+  name: "cnn_tweedie_precip"
+  base_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments"
+  output_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments/exp_11_cnn_tweedie_precip"
+  description: "Tweedie deviance loss (p=1.5, compound Poisson-Gamma MLE) for tpERA — addresses underestimation via distributional learning"
+
+seed: 42
+
+data:
+  nc_path: "/nvme/h/pgeorgiades/scratch/full_dataset.nc"
+  cache_dir: "./cache"
+  load_in_memory: true
+  rank0_only_in_memory_load: true
+  rank0_batch_broadcast: false
+  normalize: true
+  normalize_samples: 100000
+  normalize_method: "minmax"
+  train_years: [1981, 1982, 1983, 1984, 1985, 1986, 1987, 1988, 1989,
+                1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999,
+                2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009,
+                2010, 2011, 2012]
+  val_years: [2013, 2014, 2015, 2016]
+  test_years: [2017, 2018, 2019, 2020]
+  num_workers: 12
+
+model:
+  static_channels: 3          # dem, rho, phi
+  dynamic_channels: 16        # pr, tas, tasmax, hurs, sin_t, cos_t, cci×10
+  image_size: [35, 77]
+  encoder_type: "cnn"
+  encoder_dim: 512
+  encoder_blocks: 5
+  decoder_type: "multi"
+  decoder_hidden_dims: [512, 256, 128, 64]
+  target_vars: ["tasERA", "tasmaxERA", "tpERA", "rhERA"]
+  output_activations:
+    tpERA: "softplus"          # ensures mu > 0, required by Tweedie (mu clamped to eps anyway)
+  use_film: true
+  num_leads: 11
+  lead_embed_dim: 128
+
+optimizer:
+  type: "adamw"
+  lr: !!float 1e-5
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+scheduler:
+  type: "cosine"
+  min_lr: !!float 1e-7
+  factor: 0.5
+  patience: 5
+  step_size: 30
+  gamma: 0.1
+
+training:
+  batch_size: 200
+  max_epochs: 100
+  stage1_epochs: 50
+  gradient_clip_val: 1.0      # important: Tweedie gradient can spike on mu≈0 early in training
+  early_stopping_patience: 15
+  save_every_n_epochs: 5
+  val_interval: 1
+  use_amp: true
+  device: "cuda"
+
+loss:
+  weighting_strategy: equal
+  data_loss_types:
+    tasERA: hybrid
+    tasmaxERA: hybrid
+    tpERA: tweedie             # ← KEY CHANGE: Tweedie deviance (compound Poisson-Gamma MLE)
+    rhERA: hybrid
+  # Tweedie params for tpERA
+  tweedie_power: 1.5           # compound Poisson-Gamma midpoint (1 < p < 2)
+  tweedie_eps: !!float 1e-6   # mu lower clamp to prevent log(0)
+  # compositedry / wethybrid params kept but unused for tpERA
+  compositedry_gamma: 1.0
+  compositedry_overestimate_weight: 2.5
+  compositedry_dry_threshold: 0.002
+  compositedry_lambda_extreme: 1.0
+  compositedry_lambda_dry: 0.7
+  wet_weight: 10.0
+  dry_weight: 1.0
+  use_physics: false
+  physics_weight: 0.0
+  use_clausius_clapeyron: false
+  use_temp_consistency: false
+  use_humidity_bounds: false
+  use_precip_nonnegativity: false
+  use_spatial_smoothness: false
+
+logging:
+  log_level: "INFO"
+  log_interval: 50
+
+evaluation:
+  save_predictions: true

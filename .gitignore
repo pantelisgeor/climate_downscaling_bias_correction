@@ -65,3 +65,4 @@ temp/
 
 # Experiments directory
 experiments/
+logs/

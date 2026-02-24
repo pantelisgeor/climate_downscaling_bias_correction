@@ -25,6 +25,7 @@ import pandas as pd
 import torch
 import xarray as xr
 import yaml
+from torch.utils.data import DataLoader
 
 # Add project root to import path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -245,8 +246,8 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=200,
-        help="Reserved for future batched inference; currently inference runs per-sample",
+        default=256,
+        help="Number of samples per model forward pass (default: 256)",
     )
     args = parser.parse_args()
 
@@ -285,6 +286,7 @@ def main():
     print(f"Years: {selected_years}")
     print(f"Output dir: {output_dir}")
     print(f"Device: {device}")
+    print(f"Batch size: {args.batch_size}")
     print("=" * 80)
 
     # Data loader + optional scaler params
@@ -342,67 +344,102 @@ def main():
 
     print(f"Found {len(infer_indices):,} valid samples for inference")
 
-    # Grouped storage by (run, lead)
-    grouped = {}
+    # -------------------------------------------------------------------------
+    # Batched inference via DataLoader
+    # -------------------------------------------------------------------------
+    # Wrapper that also returns the original dataset index alongside each sample
+    # so we can look up raw (un-normalised) data from data_loader after the
+    # GPU forward pass.
+    class _IndexedSubset(torch.utils.data.Dataset):
+        def __init__(self, dataset, indices):
+            self.dataset = dataset
+            self.indices = indices
+
+        def __len__(self):
+            return len(self.indices)
+
+        def __getitem__(self, i):
+            orig_idx = self.indices[i]
+            return self.dataset[orig_idx], orig_idx
+
+    indexed = _IndexedSubset(full_dataset, infer_indices)
+    loader = DataLoader(
+        indexed,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,           # data is already in RAM; workers add overhead
+        pin_memory=("cuda" in device),
+    )
+
     target_vars = config["model"]["target_vars"]
     H, W = tuple(config["model"]["image_size"])
+    processed = 0
+    grouped = {}
 
-    for counter, idx in enumerate(infer_indices, start=1):
-        (static, dynamic), _, metadata = full_dataset[idx]
+    for (batch_inputs, batch_targets, batch_meta), batch_orig_indices in loader:
+        # batch_inputs  : (static [B,Cs,H,W], dynamic [B,Cd,H,W])
+        # batch_targets : dict of tensors (not needed for inference output)
+        # batch_meta    : dict, batch_meta["lead"] is a tensor of shape [B]
+        # batch_orig_indices : LongTensor [B]
 
-        static_b = static.unsqueeze(0).to(device)
-        dynamic_b = dynamic.unsqueeze(0).to(device)
-        lead_b = metadata["lead"].unsqueeze(0).to(device)
+        static_b  = batch_inputs[0].to(device)
+        dynamic_b = batch_inputs[1].to(device)
+        lead_b    = batch_meta["lead"].to(device)
 
         with torch.no_grad():
             pred_dict = model(static=static_b, dynamic=dynamic_b, lead_indices=lead_b)
 
-        # Convert predictions to numpy + denormalize if needed
-        pred_np = {}
-        for var in target_vars:
-            arr = pred_dict[var].detach().cpu().numpy()[0, 0]  # (H, W)
-            arr = denormalize_prediction_if_needed(
-                arr,
-                var_name=var,
-                normalize_enabled=config["data"].get("normalize", True),
-                data_loader=data_loader,
-            )
-            pred_np[var] = arr.astype(np.float32)
+        B = static_b.shape[0]
+        for b in range(B):
+            orig_idx = int(batch_orig_indices[b].item())
 
-        # Raw inputs/targets in original scale from DecadalDataLoader
-        raw_inputs, raw_targets = data_loader[idx]
-        raw_inputs = raw_inputs.reshape(19, H, W).astype(np.float32)
-        raw_targets = raw_targets.reshape(4, H, W).astype(np.float32)
+            # Denormalize per-variable predictions
+            pred_np = {}
+            for var in target_vars:
+                arr = pred_dict[var][b, 0].detach().cpu().numpy()  # (H, W)
+                arr = denormalize_prediction_if_needed(
+                    arr,
+                    var_name=var,
+                    normalize_enabled=config["data"].get("normalize", True),
+                    data_loader=data_loader,
+                )
+                pred_np[var] = arr.astype(np.float32)
 
-        combo_info = data_loader.get_combination_info(idx)
-        run = combo_info["run"]
-        lead = int(combo_info["lead"])
-        time_value = pd.Timestamp(combo_info["time"]).to_datetime64()
+            # Raw inputs/targets are fetched per-sample from heap (already RAM)
+            raw_inputs, raw_targets = data_loader[orig_idx]
+            raw_inputs  = raw_inputs.reshape(19, H, W).astype(np.float32)
+            raw_targets = raw_targets.reshape(4, H, W).astype(np.float32)
 
-        key = (run, lead)
-        if key not in grouped:
-            grouped[key] = {
-                "times": [],
-                "inputs": {name: [] for name in INPUT_VAR_NAMES},
-                "targets": {name: [] for name in TARGET_VAR_NAMES},
-                "preds": {name: [] for name in target_vars},
-            }
+            combo_info = data_loader.get_combination_info(orig_idx)
+            run        = combo_info["run"]
+            lead       = int(combo_info["lead"])
+            time_value = pd.Timestamp(combo_info["time"]).to_datetime64()
 
-        grouped[key]["times"].append(time_value)
+            key = (run, lead)
+            if key not in grouped:
+                grouped[key] = {
+                    "times":   [],
+                    "inputs":  {name: [] for name in INPUT_VAR_NAMES},
+                    "targets": {name: [] for name in TARGET_VAR_NAMES},
+                    "preds":   {name: [] for name in target_vars},
+                }
 
-        for in_name in INPUT_VAR_NAMES:
-            grouped[key]["inputs"][in_name].append(
-                raw_inputs[INPUT_CHANNEL_INDEX[in_name]]
-            )
+            grouped[key]["times"].append(time_value)
 
-        for i, t_name in enumerate(TARGET_VAR_NAMES):
-            grouped[key]["targets"][t_name].append(raw_targets[i])
+            for in_name in INPUT_VAR_NAMES:
+                grouped[key]["inputs"][in_name].append(
+                    raw_inputs[INPUT_CHANNEL_INDEX[in_name]]
+                )
 
-        for t_name in target_vars:
-            grouped[key]["preds"][t_name].append(pred_np[t_name])
+            for i, t_name in enumerate(TARGET_VAR_NAMES):
+                grouped[key]["targets"][t_name].append(raw_targets[i])
 
-        if counter % 500 == 0 or counter == len(infer_indices):
-            print(f"Processed {counter:,}/{len(infer_indices):,} samples")
+            for t_name in target_vars:
+                grouped[key]["preds"][t_name].append(pred_np[t_name])
+
+        processed += B
+        if processed % 500 < args.batch_size or processed == len(infer_indices):
+            print(f"Processed {processed:,}/{len(infer_indices):,} samples")
 
     # Shared spatial coordinates
     lat_vals = data_loader.ds.latitude.values.astype(np.float32)

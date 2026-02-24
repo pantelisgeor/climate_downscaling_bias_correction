@@ -1,20 +1,22 @@
-# exp_03_cnn_shared.yml
+# exp_02_cnn_physics.yml
 # ──────────────────────────────────────────────────────────────────────────────
-# EXPERIMENT 03 — CNN + shared decoder (ablation: decoder architecture)
-# Purpose : Test whether a single shared trunk (4-channel output, per-var
-#           activations) outperforms four independent decoder heads (exp_01).
-#           Shared decoder has fewer parameters but forces the model to produce
-#           all 4 outputs jointly in the same feature space; potentially better
-#           for physically correlated variables (tas/tasmax/rh).
+# EXPERIMENT 02 — CNN + physics losses (ablation: effect of physics constraints)
+# Purpose : Identical to exp_01 except physics losses are enabled in stage 2
+#           (epochs 51-100). Physics losses now operate in physical units
+#           (denormalised internally) following the recent PhysicsInformedLoss
+#           rewrite.
 # Key differences vs exp_01:
-#   - decoder_type: "shared"
+#   - use_physics: true
+#   - CC law, temp consistency, humidity bounds all active
+#   - physics_weight: 0.02  (empirically best from baseline history; 0.2 caused
+#                            spatial distortions in default_7/8)
 # ──────────────────────────────────────────────────────────────────────────────
 
 experiment:
-  name: "cnn_shared"
+  name: "cnn_physics"
   base_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments"
-  output_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments/exp_03_cnn_shared"
-  description: "CNN shared-decoder, wethybrid, no physics — ablate decoder architecture"
+  output_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments/exp_02_cnn_physics"
+  description: "CNN multi-decoder, wethybrid, physics ON (weight=0.02) — ablate physics benefit"
 
 seed: 42
 
@@ -42,7 +44,7 @@ model:
   encoder_type: "cnn"
   encoder_dim: 512
   encoder_blocks: 5
-  decoder_type: "shared"      # single trunk → 4-channel output (vs "multi")
+  decoder_type: "multi"
   decoder_hidden_dims: [512, 256, 128, 64]
   target_vars: ["tasERA", "tasmaxERA", "tpERA", "rhERA"]
   output_activations:
@@ -68,7 +70,7 @@ scheduler:
 training:
   batch_size: 256
   max_epochs: 100
-  stage1_epochs: 50
+  stage1_epochs: 50           # data-loss only for first 50 epochs
   gradient_clip_val: 1.0
   early_stopping_patience: 15
   save_every_n_epochs: 5
@@ -82,15 +84,17 @@ loss:
     tasERA: hybrid
     tasmaxERA: hybrid
     tpERA: wethybrid
-    rhERA: hybrid
-  wet_weight: 10.0
+    rhERA: mse
+  wet_weight: 5.0
   dry_weight: 1.0
-  use_physics: false
-  physics_weight: 0.0
-  use_clausius_clapeyron: false
-  use_temp_consistency: false
-  use_humidity_bounds: false
-  use_precip_nonnegativity: false
+  # Physics ON — added in stage 2 (after stage1_epochs)
+  use_physics: true
+  physics_weight: 0.02        # 0.02 keeps physical plausibility without
+                              # dominating data loss (0.2 caused artefacts)
+  use_clausius_clapeyron: true
+  use_temp_consistency: true
+  use_humidity_bounds: true
+  use_precip_nonnegativity: false  # always near-zero with softplus; skip for efficiency
   use_spatial_smoothness: false
 
 logging:

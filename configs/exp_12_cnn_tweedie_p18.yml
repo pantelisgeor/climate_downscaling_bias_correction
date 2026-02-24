@@ -1,0 +1,142 @@
+# exp_12_cnn_tweedie_p18.yml
+# ──────────────────────────────────────────────────────────────────────────────
+# EXPERIMENT 12 — Tweedie deviance loss with p=1.8 (heavy-tail Gamma focus)
+#
+# Context — what exp_11 (p=1.5) told us:
+#   The Tweedie loss at p=1.5 successfully corrected the systematic below-100mm
+#   underestimation and produced a good spatial distribution.  However, the
+#   Q-Q plot reveals that events above 100mm are still underestimated.
+#
+# Why p=1.5 is insufficient for the upper tail:
+#   The Tweedie family interpolates between:
+#     p → 1  :  Poisson  — emphasises the zero mass (dry days)
+#     p → 2  :  Gamma    — emphasises the continuous positive tail (wet days)
+#   At p=1.5 the compound distribution treats both components equally.
+#   For Cyprus, where extreme precipitation events drive the >100mm tail,
+#   the Poisson component is pulling the learned distribution back toward
+#   zero more than necessary — the dry-day classification was already
+#   well-handled by exp_11.
+#
+# Fix: increase p from 1.5 → 1.8
+#   The Tweedie deviance gradient w.r.t. mu is:
+#       dD/dmu = 2 * (mu^(1-p) - y * mu^(-p))
+#   With p=1.8:
+#     • For large y with small mu:  y*mu^(-1.8) grows dramatically as mu→0,
+#       creating a far stronger restoring gradient toward higher predictions.
+#     • For dry pixels (y=0):       term reduces to 2*mu^(-0.8), which still
+#       penalises over-prediction but less aggressively than the wet term.
+#   Net effect: the Gamma tail dominates, the network is incentivised to
+#   predict heavier amounts on wet days without losing the zero-inflation
+#   structure entirely.
+#
+# Stability note:
+#   mu^(-1.8) → ∞ as mu → 0, making early-training gradients more volatile
+#   than at p=1.5.  Two mitigations:
+#     1. gradient_clip_val: 1.0 → 0.5   (halved, tighter clipping)
+#     2. tweedie_eps: 1e-6 → 5e-6       (wider lower clamp on mu,
+#        prevents extreme 1/mu^1.8 spikes in the first epochs)
+#   These are conservative; relax if convergence stalls.
+#
+# All other hyperparameters identical to exp_11.
+# ──────────────────────────────────────────────────────────────────────────────
+
+experiment:
+  name: "cnn_tweedie_p18"
+  base_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments"
+  output_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments/exp_12_cnn_tweedie_p18"
+  description: "Tweedie deviance loss (p=1.8, Gamma-dominant MLE) — targets >100mm underestimation in exp_11"
+
+seed: 42
+
+data:
+  nc_path: "/nvme/h/pgeorgiades/scratch/full_dataset.nc"
+  cache_dir: "./cache"
+  load_in_memory: true
+  rank0_only_in_memory_load: true
+  rank0_batch_broadcast: false
+  normalize: true
+  normalize_samples: 100000
+  normalize_method: "minmax"
+  train_years: [1981, 1982, 1983, 1984, 1985, 1986, 1987, 1988, 1989,
+                1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999,
+                2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009,
+                2010, 2011, 2012]
+  val_years: [2013, 2014, 2015, 2016]
+  test_years: [2017, 2018, 2019, 2020]
+  num_workers: 12
+
+model:
+  static_channels: 3          # dem, rho, phi
+  dynamic_channels: 16        # pr, tas, tasmax, hurs, sin_t, cos_t, cci×10
+  image_size: [35, 77]
+  encoder_type: "cnn"
+  encoder_dim: 512
+  encoder_blocks: 5
+  decoder_type: "multi"
+  decoder_hidden_dims: [512, 256, 128, 64]
+  target_vars: ["tasERA", "tasmaxERA", "tpERA", "rhERA"]
+  output_activations:
+    tpERA: "softplus"          # ensures mu > 0, clamped further by tweedie_eps
+  use_film: true
+  num_leads: 11
+  lead_embed_dim: 128
+
+optimizer:
+  type: "adamw"
+  lr: !!float 1e-5
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+scheduler:
+  type: "cosine"
+  min_lr: !!float 1e-7
+  factor: 0.5
+  patience: 5
+  step_size: 30
+  gamma: 0.1
+
+training:
+  batch_size: 200
+  max_epochs: 100
+  stage1_epochs: 50
+  gradient_clip_val: 0.5      # ← tightened from 1.0: mu^(-1.8) can spike on
+                              #   near-zero predictions early in training
+  early_stopping_patience: 15
+  save_every_n_epochs: 5
+  val_interval: 1
+  use_amp: true
+  device: "cuda"
+
+loss:
+  weighting_strategy: equal
+  data_loss_types:
+    tasERA: hybrid
+    tasmaxERA: hybrid
+    tpERA: tweedie             # Tweedie deviance with Gamma-dominant p=1.8
+    rhERA: hybrid
+  # Tweedie params for tpERA
+  tweedie_power: 1.8           # ← KEY CHANGE: 1.5 → 1.8, Gamma-dominant tail
+  tweedie_eps: !!float 5e-6   # ← wider lower clamp (was 1e-6): prevents extreme
+                              #   mu^(-1.8) spikes when mu ≈ 0 early in training
+  # compositedry / wethybrid params kept but unused for tpERA
+  compositedry_gamma: 1.0
+  compositedry_overestimate_weight: 2.5
+  compositedry_dry_threshold: 0.002
+  compositedry_lambda_extreme: 1.0
+  compositedry_lambda_dry: 0.7
+  wet_weight: 10.0
+  dry_weight: 1.0
+  use_physics: false
+  physics_weight: 0.0
+  use_clausius_clapeyron: false
+  use_temp_consistency: false
+  use_humidity_bounds: false
+  use_precip_nonnegativity: false
+  use_spatial_smoothness: false
+
+logging:
+  log_level: "INFO"
+  log_interval: 50
+
+evaluation:
+  save_predictions: true
