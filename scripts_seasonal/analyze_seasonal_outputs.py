@@ -4,13 +4,14 @@ Post-process seasonal ClimateNet inference NetCDF outputs.
 Direct analogue of scripts/analyze_inference_outputs.py adapted for the
 seasonal forecast pipeline:
 
-  • Input NetCDF files are named  inference_member_*_lead_*.nc
-  • NetCDF global attributes use  member_number / lead_month  (not run / lead)
+  • Input NetCDF files are named  inference_lead_*_year_*.nc
+  • Each file contains a 'member' dimension (25 ensemble members)
+  • Global attributes use  lead_month / year
   • Input variable names in the NetCDFs: tp, t2m, tmax, hurs
     (decadal used: pr, tas, tasmax, hurs)
 
 All analysis functionality – monthly aggregation, spatial maps, scatter plots,
-bias plots, Taylor diagrams – is preserved unchanged from the decadal script.
+bias plots, Taylor diagrams, Q-Q plots – mirrors scripts/analyze_inference_outputs.py.
 """
 
 from __future__ import annotations
@@ -32,8 +33,9 @@ except ImportError:
 
 
 # ── variable configuration ────────────────────────────────────────────────────
-# 'input' key = the variable name stored in the inference NetCDF for the
-#  raw forecast (seasonal names: tp, t2m, tmax, hurs).
+# 'input' key = the variable name stored in the inference NetCDF for the raw
+# seasonal forecast field.  Decadal used pr/tas/tasmax/hurs; seasonal uses
+# tp/t2m/tmax/hurs.
 
 VAR_CONFIG = {
     "tas": {
@@ -71,46 +73,87 @@ VAR_CONFIG = {
 }
 
 
-# ── unit conversion ───────────────────────────────────────────────────────────
-
 def _convert_units(arr: xr.DataArray, key: str) -> xr.DataArray:
-    """Convert to standard plotting/output units."""
+    """Convert to requested plotting/output units.
+
+    - tas/tasmax and corresponding targets/preds: Kelvin -> Celsius
+    - tp and pr monthly totals: meters -> millimeters
+    - rh/hurs and corresponding targets/preds: fraction -> percent (if needed)
+    """
     out = arr.astype(np.float32)
 
-    if key in ("tas", "tasmax"):
-        # Kelvin → Celsius
+    if key in {"tas", "tasmax"}:
         out = (out - 273.15).astype(np.float32)
     elif key == "tp":
-        # m/day (ERA5 convention) → mm;  multiply monthly sums × 1000
         out = (out * 1000.0).astype(np.float32)
     elif key == "rh":
         finite = out.values[np.isfinite(out.values)]
         if finite.size > 0 and np.nanpercentile(finite, 99) <= 1.5:
-            # fraction → percent
             out = (out * 100.0).astype(np.float32)
 
     return out
 
 
-# ── file opening ──────────────────────────────────────────────────────────────
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Aggregate and visualize seasonal inference NetCDF outputs"
+    )
+    parser.add_argument(
+        "--input-dir",
+        type=str,
+        required=True,
+        help="Directory containing inference_lead_*_year_*.nc files",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output directory (default: <input-dir>/analysis)",
+    )
+    parser.add_argument(
+        "--pattern",
+        type=str,
+        default="inference_lead_*_year_*.nc",
+        help="Glob pattern for inference files",
+    )
+    parser.add_argument(
+        "--reliability-bins",
+        type=int,
+        default=20,
+        help="Number of bins for reliability plots",
+    )
+    parser.add_argument(
+        "--dpi",
+        type=int,
+        default=200,
+        help="Figure DPI",
+    )
+    return parser.parse_args()
 
-def open_and_tag_file(path: Path) -> xr.Dataset:
-    """
-    Open an inference NetCDF and attach member_number / lead_month coordinates.
+
+def open_and_tag_file(path: Path) -> List[xr.Dataset]:
+    """Open an inference NetCDF (member × time × lat × lon) and split into
+    one combo-tagged dataset per ensemble member.
+
+    The combo label is  lead_{L}_year_{Y}_member_{M}.
     """
     ds = xr.open_dataset(path)
-    member = str(ds.attrs.get("member_number", ds.attrs.get("run", "unknown")))
-    lead   = int(ds.attrs.get("lead_month",    ds.attrs.get("lead", -1)))
-    combo  = f"member_{member}_lead_{lead}"
-    ds = ds.expand_dims(combo=[combo])
-    ds = ds.assign_coords(
-        member_number=("combo", [member]),
-        lead_month=("combo", [lead]),
-    )
-    return ds
+    lead = int(ds.attrs.get("lead_month", -1))
+    year = int(ds.attrs.get("year", -1))
 
+    out = []
+    for m in ds.member.values:
+        member_ds = ds.sel(member=m).drop_vars("member")
+        combo = f"lead_{lead}_year_{year}_member_{int(m)}"
+        member_ds = member_ds.expand_dims(combo=[combo])
+        member_ds = member_ds.assign_coords(
+            lead_month=("combo", [lead]),
+            year=("combo", [year]),
+            member=("combo", [int(m)]),
+        )
+        out.append(member_ds)
+    return out
 
-# ── monthly aggregation ───────────────────────────────────────────────────────
 
 def monthly_aggregate(ds: xr.Dataset) -> xr.Dataset:
     out = xr.Dataset()
@@ -122,21 +165,26 @@ def monthly_aggregate(ds: xr.Dataset) -> xr.Dataset:
         agg         = cfg["agg"]
 
         if agg == "sum":
-            in_m  = ds[input_name].resample(time="MS").sum()
-            tgt_m = ds[target_name].resample(time="MS").sum()
-            prd_m = ds[pred_name].resample(time="MS").sum()
+            input_month  = ds[input_name].resample(time="MS").sum()
+            target_month = ds[target_name].resample(time="MS").sum()
+            pred_month   = ds[pred_name].resample(time="MS").sum()
         else:
-            in_m  = ds[input_name].resample(time="MS").mean()
-            tgt_m = ds[target_name].resample(time="MS").mean()
-            prd_m = ds[pred_name].resample(time="MS").mean()
+            input_month  = ds[input_name].resample(time="MS").mean()
+            target_month = ds[target_name].resample(time="MS").mean()
+            pred_month   = ds[pred_name].resample(time="MS").mean()
 
-        out[f"{key}_input_monthly"]  = _convert_units(in_m,  key).astype(np.float32)
-        out[f"{key}_target_monthly"] = _convert_units(tgt_m, key).astype(np.float32)
-        out[f"{key}_pred_monthly"]   = _convert_units(prd_m, key).astype(np.float32)
+        input_month  = _convert_units(input_month,  key)
+        target_month = _convert_units(target_month, key)
+        pred_month   = _convert_units(pred_month,   key)
+
+        out[f"{key}_input_monthly"]  = input_month.astype(np.float32)
+        out[f"{key}_target_monthly"] = target_month.astype(np.float32)
+        out[f"{key}_pred_monthly"]   = pred_month.astype(np.float32)
 
     out = out.assign_coords(
-        member_number=ds.member_number,
         lead_month=ds.lead_month,
+        year=ds.year,
+        member=ds.member,
     )
     return out
 
@@ -144,356 +192,470 @@ def monthly_aggregate(ds: xr.Dataset) -> xr.Dataset:
 def collate_monthly(files: List[Path]) -> xr.Dataset:
     monthly_list = []
     for path in files:
-        ds_file  = open_and_tag_file(path)
-        ds_month = monthly_aggregate(ds_file)
-        monthly_list.append(ds_month)
+        for ds_file in open_and_tag_file(path):
+            ds_month = monthly_aggregate(ds_file)
+            monthly_list.append(ds_month)
+
     collated = xr.concat(monthly_list, dim="combo")
-    return collated.sortby("combo")
+    # Ensure deterministic order
+    collated = collated.sortby("combo")
+    return collated
 
 
 def save_collated(collated: xr.Dataset, output_path: Path) -> None:
-    enc = {
+    encoding = {
         name: {"zlib": True, "complevel": 5, "dtype": "float32"}
         for name in collated.data_vars
     }
-    enc["latitude"]  = {"dtype": "float32"}
-    enc["longitude"] = {"dtype": "float32"}
-    collated.to_netcdf(output_path, encoding=enc)
+    encoding["latitude"]  = {"dtype": "float32"}
+    encoding["longitude"] = {"dtype": "float32"}
+    collated.to_netcdf(output_path, encoding=encoding)
 
 
-# ── utility ───────────────────────────────────────────────────────────────────
-
-def robust_limits(a: np.ndarray, q_low=2.5, q_high=97.5) -> Tuple[float, float]:
+def robust_limits(a: np.ndarray, q_low: float = 2.5, q_high: float = 97.5) -> Tuple[float, float]:
     finite = a[np.isfinite(a)]
     if finite.size == 0:
         return -1.0, 1.0
-    lo, hi = float(np.percentile(finite, q_low)), float(np.percentile(finite, q_high))
+    lo = float(np.percentile(finite, q_low))
+    hi = float(np.percentile(finite, q_high))
     if np.isclose(lo, hi):
-        lo -= 1.0; hi += 1.0
+        lo -= 1.0
+        hi += 1.0
     return lo, hi
 
 
-# ── map plots ─────────────────────────────────────────────────────────────────
-
-def _add_map_axes(fig, pos, title: str, data: np.ndarray,
-                  lat: np.ndarray, lon: np.ndarray,
-                  cmap="viridis", vmin=None, vmax=None, dpi=200):
-    if HAS_CARTOPY:
-        ax = fig.add_subplot(pos, projection=ccrs.PlateCarree())
-        im = ax.pcolormesh(lon, lat, data, cmap=cmap, vmin=vmin, vmax=vmax,
-                           transform=ccrs.PlateCarree())
-        ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
-        ax.add_feature(cfeature.BORDERS,   linewidth=0.3)
-    else:
-        ax = fig.add_subplot(pos)
-        im = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, origin="upper",
-                       extent=[lon.min(), lon.max(), lat.min(), lat.max()])
-    ax.set_title(title, fontsize=9)
-    return ax, im
+def sym_limits(a: np.ndarray, q: float = 97.5) -> Tuple[float, float]:
+    finite = a[np.isfinite(a)]
+    if finite.size == 0:
+        return -1.0, 1.0
+    vmax = float(np.percentile(np.abs(finite), q))
+    if np.isclose(vmax, 0.0):
+        vmax = 1.0
+    return -vmax, vmax
 
 
-def plot_spatial_panels(collated: xr.Dataset, output_dir: Path, dpi: int = 200):
-    """6-panel maps (input mean, target mean, pred mean, input bias, pred bias, improvement)."""
-    lat = collated.latitude.values
-    lon = collated.longitude.values
+def create_six_panel_maps(collated: xr.Dataset, output_dir: Path, dpi: int = 200) -> None:
+    map_dir = output_dir / "maps_6panel"
+    map_dir.mkdir(parents=True, exist_ok=True)
+
+    if not HAS_CARTOPY:
+        print(
+            "WARNING: cartopy is not installed. Maps will be generated without "
+            "coastlines/country borders."
+        )
 
     for key, cfg in VAR_CONFIG.items():
-        in_key  = f"{key}_input_monthly"
-        tgt_key = f"{key}_target_monthly"
-        prd_key = f"{key}_pred_monthly"
+        input_name  = f"{key}_input_monthly"
+        target_name = f"{key}_target_monthly"
+        pred_name   = f"{key}_pred_monthly"
 
-        if not all(k in collated for k in (in_key, tgt_key, prd_key)):
-            continue
+        inp  = collated[input_name].mean(dim=["combo", "time"]).values
+        tgt  = collated[target_name].mean(dim=["combo", "time"]).values
+        pred = collated[pred_name].mean(dim=["combo", "time"]).values
 
-        in_mean  = float(collated[in_key].mean("combo").mean("time").values)  # scalar check
-        # Actually we want (lat, lon) arrays:
-        in_spatial  = collated[in_key].mean(["combo","time"]).values
-        tgt_spatial = collated[tgt_key].mean(["combo","time"]).values
-        prd_spatial = collated[prd_key].mean(["combo","time"]).values
+        d_in_tgt    = inp - tgt
+        d_pred_tgt  = pred - tgt
+        improvement = np.abs(pred - tgt) - np.abs(inp - tgt)
 
-        in_bias  = in_spatial  - tgt_spatial
-        prd_bias = prd_spatial - tgt_spatial
-        improve  = np.abs(in_bias) - np.abs(prd_bias)
+        vmin, vmax   = robust_limits(np.concatenate([inp.ravel(), tgt.ravel(), pred.ravel()]))
+        dvmin, dvmax = sym_limits(np.concatenate([d_in_tgt.ravel(), d_pred_tgt.ravel()]))
+        ivmin, ivmax = sym_limits(improvement.ravel())
 
-        vmin_val, vmax_val = robust_limits(np.concatenate([
-            in_spatial.flatten(), tgt_spatial.flatten(), prd_spatial.flatten()
-        ]))
-        bias_lim = max(abs(float(np.nanpercentile(np.abs(in_bias), 97))),
-                       abs(float(np.nanpercentile(np.abs(prd_bias), 97))))
+        lat = collated.latitude.values
+        lon = collated.longitude.values
 
-        fig = plt.figure(figsize=(18, 10))
-        for i, (data, title, cmap, vl, vh) in enumerate([
-            (in_spatial,  f"{cfg['label']} – Input mean",   "viridis", vmin_val, vmax_val),
-            (tgt_spatial, f"{cfg['label']} – Target mean",  "viridis", vmin_val, vmax_val),
-            (prd_spatial, f"{cfg['label']} – Pred mean",    "viridis", vmin_val, vmax_val),
-            (in_bias,     f"{cfg['label']} – Input bias",   "RdBu_r",  -bias_lim, bias_lim),
-            (prd_bias,    f"{cfg['label']} – Pred bias",    "RdBu_r",  -bias_lim, bias_lim),
-            (improve,     f"{cfg['label']} – Improvement",  "RdYlGn",  -bias_lim, bias_lim),
-        ]):
-            ax, im = _add_map_axes(fig, (2, 3, i + 1), title, data,
-                                   lat, lon, cmap, vl, vh)
-            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
-                         label=cfg["units"])
+        lon_min, lon_max = float(np.min(lon)), float(np.max(lon))
+        lat_min, lat_max = float(np.min(lat)), float(np.max(lat))
 
-        plt.suptitle(f"{cfg['label']} – Seasonal seasonal (mean over all members/leads)", y=1.01)
-        plt.tight_layout()
-        plt.savefig(output_dir / f"maps_{key}.png", dpi=dpi, bbox_inches="tight")
-        plt.close()
+        if HAS_CARTOPY:
+            fig, axes = plt.subplots(
+                2, 3,
+                figsize=(20, 8.5),
+                constrained_layout=True,
+                subplot_kw={"projection": ccrs.PlateCarree()},
+            )
+        else:
+            fig, axes = plt.subplots(2, 3, figsize=(20, 8.5), constrained_layout=True)
 
+        def _pm(ax, data, cmap, vl, vh):
+            if HAS_CARTOPY:
+                return ax.pcolormesh(lon, lat, data, shading="auto",
+                                     cmap=cmap, vmin=vl, vmax=vh,
+                                     transform=ccrs.PlateCarree())
+            return ax.pcolormesh(lon, lat, data, shading="auto",
+                                 cmap=cmap, vmin=vl, vmax=vh)
 
-# ── scatter plots ─────────────────────────────────────────────────────────────
+        p0 = _pm(axes[0, 0], inp,          "viridis", vmin,  vmax)
+        p1 = _pm(axes[0, 1], tgt,          "viridis", vmin,  vmax)
+        p2 = _pm(axes[0, 2], pred,         "viridis", vmin,  vmax)
+        p3 = _pm(axes[1, 0], d_in_tgt,    "RdBu_r",  dvmin, dvmax)
+        p4 = _pm(axes[1, 1], d_pred_tgt,  "RdBu_r",  dvmin, dvmax)
+        p5 = _pm(axes[1, 2], improvement, "RdBu_r",  ivmin, ivmax)
 
-def plot_scatter(collated: xr.Dataset, output_dir: Path, dpi: int = 200):
-    """2-panel scatter: input vs target (left) and pred vs target (right)."""
-    for key, cfg in VAR_CONFIG.items():
-        in_key  = f"{key}_input_monthly"
-        tgt_key = f"{key}_target_monthly"
-        prd_key = f"{key}_pred_monthly"
-        if not all(k in collated for k in (in_key, tgt_key, prd_key)):
-            continue
+        titles = [
+            f"{cfg['label']} Input ({cfg['input']})",
+            f"{cfg['label']} Target",
+            f"{cfg['label']} Prediction",
+            "Input - Target",
+            "Prediction - Target",
+            "Improvement (blue better, red worse)",
+        ]
+        for ax, title in zip(axes.ravel(), titles):
+            ax.set_title(title)
+            ax.set_xlabel("Longitude")
+            ax.set_ylabel("Latitude")
+            if HAS_CARTOPY:
+                ax.set_extent([lon_min, lon_max, lat_min, lat_max],
+                              crs=ccrs.PlateCarree())
+                ax.coastlines(resolution="50m", linewidth=0.7)
+                ax.add_feature(cfeature.BORDERS, linewidth=0.5)
+            else:
+                ax.set_aspect("auto")
 
-        in_v   = collated[in_key].values.flatten()
-        tgt_v  = collated[tgt_key].values.flatten()
-        prd_v  = collated[prd_key].values.flatten()
+        cbar1 = fig.colorbar(p2, ax=axes[0, :], shrink=0.85, location="right")
+        cbar1.set_label(cfg["units"])
+        cbar2 = fig.colorbar(p4, ax=axes[1, :2], shrink=0.85, location="right")
+        cbar2.set_label(cfg["units"])
+        cbar3 = fig.colorbar(p5, ax=axes[1, 2], shrink=0.85, location="right")
+        cbar3.set_label(cfg["units"])
 
-        mask = np.isfinite(in_v) & np.isfinite(tgt_v) & np.isfinite(prd_v)
-        in_v, tgt_v, prd_v = in_v[mask], tgt_v[mask], prd_v[mask]
-
-        if len(tgt_v) > 15_000:
-            s = np.random.choice(len(tgt_v), 15_000, replace=False)
-            in_v, tgt_v, prd_v = in_v[s], tgt_v[s], prd_v[s]
-
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-        for ax, x, label in [(ax1, in_v, "Input"), (ax2, prd_v, "Pred")]:
-            ax.scatter(tgt_v, x, alpha=0.3, s=1, c="steelblue")
-            lo = min(tgt_v.min(), x.min())
-            hi = max(tgt_v.max(), x.max())
-            ax.plot([lo, hi], [lo, hi], "r--", lw=1.5)
-            r2 = 1 - np.sum((tgt_v - x)**2) / (np.sum((tgt_v - tgt_v.mean())**2) + 1e-8)
-            bias = float(np.mean(x - tgt_v))
-            rmse = float(np.sqrt(np.mean((x - tgt_v)**2)))
-            ax.text(0.05, 0.95,
-                    f"R²={r2:.3f}\nRMSE={rmse:.3f}\nBias={bias:.3f}",
-                    transform=ax.transAxes, fontsize=9, va="top",
-                    bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
-            ax.set_xlabel(f"Target ({cfg['units']})")
-            ax.set_ylabel(f"{label} ({cfg['units']})")
-            ax.set_title(f"{cfg['label']} – {label} vs Target")
-            ax.grid(True, alpha=0.3)
-
-        plt.tight_layout()
-        plt.savefig(output_dir / f"scatter_{key}.png", dpi=dpi, bbox_inches="tight")
-        plt.close()
+        out_path = map_dir / f"{key}_6panel_map.png"
+        fig.savefig(out_path, dpi=dpi)
+        plt.close(fig)
 
 
-# ── bias reliability ──────────────────────────────────────────────────────────
+def binned_bias_curves(
+    target: np.ndarray,
+    input_vals: np.ndarray,
+    pred_vals: np.ndarray,
+    nbins: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    finite_mask = np.isfinite(target) & np.isfinite(input_vals) & np.isfinite(pred_vals)
+    target     = target[finite_mask]
+    input_vals = input_vals[finite_mask]
+    pred_vals  = pred_vals[finite_mask]
 
-def plot_reliability_bias(collated: xr.Dataset, output_dir: Path,
-                          n_bins: int = 20, dpi: int = 200):
-    """2-row bias plot: top = input/pred bias by intensity; bottom = improvement."""
-    for key, cfg in VAR_CONFIG.items():
-        in_key  = f"{key}_input_monthly"
-        tgt_key = f"{key}_target_monthly"
-        prd_key = f"{key}_pred_monthly"
-        if not all(k in collated for k in (in_key, tgt_key, prd_key)):
-            continue
+    if target.size == 0:
+        return np.array([]), np.array([]), np.array([]), np.array([])
 
-        in_v  = collated[in_key].values.flatten()
-        tgt_v = collated[tgt_key].values.flatten()
-        prd_v = collated[prd_key].values.flatten()
-        mask  = np.isfinite(in_v) & np.isfinite(tgt_v) & np.isfinite(prd_v)
-        in_v, tgt_v, prd_v = in_v[mask], tgt_v[mask], prd_v[mask]
+    lo = np.percentile(target, 2.5)
+    hi = np.percentile(target, 97.5)
+    if np.isclose(lo, hi):
+        hi = lo + 1e-6
 
-        bins    = np.percentile(tgt_v, np.linspace(0, 100, n_bins + 1))
-        centres = 0.5 * (bins[:-1] + bins[1:])
-        in_bias_bins  = np.full(n_bins, np.nan)
-        prd_bias_bins = np.full(n_bins, np.nan)
-        improve_bins  = np.full(n_bins, np.nan)
+    edges   = np.linspace(lo, hi, nbins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
 
-        for b in range(n_bins):
-            sel = (tgt_v >= bins[b]) & (tgt_v < bins[b + 1])
-            if sel.sum() < 3:
-                continue
-            in_bias_bins[b]  = float(np.mean(in_v[sel]  - tgt_v[sel]))
-            prd_bias_bins[b] = float(np.mean(prd_v[sel] - tgt_v[sel]))
-            improve_bins[b]  = float(np.mean(np.abs(in_v[sel] - tgt_v[sel])
-                                            - np.abs(prd_v[sel] - tgt_v[sel])))
+    input_bias = np.full(nbins, np.nan, dtype=np.float64)
+    pred_bias  = np.full(nbins, np.nan, dtype=np.float64)
 
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8), sharex=True)
-        ax1.plot(centres, in_bias_bins,  "b-o", ms=4, label="Input bias")
-        ax1.plot(centres, prd_bias_bins, "r-s", ms=4, label="Pred bias")
-        ax1.axhline(0, color="k", lw=0.8, ls="--")
-        ax1.set_ylabel(f"Bias ({cfg['units']})")
-        ax1.set_title(f"{cfg['label']} – Reliability bias")
-        ax1.legend(); ax1.grid(True, alpha=0.3)
+    input_err = input_vals - target
+    pred_err  = pred_vals  - target
 
-        ax2.bar(centres, improve_bins, width=np.diff(bins).mean() * 0.8,
-                color=np.where(improve_bins >= 0, "green", "tomato"), alpha=0.8)
-        ax2.axhline(0, color="k", lw=0.8)
-        ax2.set_xlabel(f"Target intensity ({cfg['units']})")
-        ax2.set_ylabel("MAE improvement")
-        ax2.set_title("Improvement (positive = model better)")
-        ax2.grid(True, alpha=0.3)
+    for i in range(nbins):
+        in_bin = (target >= edges[i]) & (target < edges[i + 1])
+        if i == nbins - 1:
+            in_bin = (target >= edges[i]) & (target <= edges[i + 1])
+        if np.any(in_bin):
+            input_bias[i] = np.mean(input_err[in_bin])
+            pred_bias[i]  = np.mean(pred_err[in_bin])
 
-        plt.tight_layout()
-        plt.savefig(output_dir / f"bias_reliability_{key}.png",
-                    dpi=dpi, bbox_inches="tight")
-        plt.close()
+    improvement = np.abs(input_bias) - np.abs(pred_bias)
+    return centers, input_bias, pred_bias, improvement
 
 
-# ── Taylor diagram ────────────────────────────────────────────────────────────
-
-def plot_taylor_diagram(collated: xr.Dataset, output_dir: Path, dpi: int = 200):
-    """Rudimentary Taylor diagram (normalised std vs correlation) for each variable."""
-    import matplotlib.patches as mpatches
+def create_reliability_plots(
+    collated: xr.Dataset,
+    output_dir: Path,
+    nbins: int = 20,
+    dpi: int = 200,
+) -> None:
+    rel_dir = output_dir / "reliability"
+    rel_dir.mkdir(parents=True, exist_ok=True)
 
     for key, cfg in VAR_CONFIG.items():
-        in_key  = f"{key}_input_monthly"
-        tgt_key = f"{key}_target_monthly"
-        prd_key = f"{key}_pred_monthly"
-        if not all(k in collated for k in (in_key, tgt_key, prd_key)):
+        input_name  = f"{key}_input_monthly"
+        target_name = f"{key}_target_monthly"
+        pred_name   = f"{key}_pred_monthly"
+
+        target = collated[target_name].values.ravel()
+        inp    = collated[input_name].values.ravel()
+        pred   = collated[pred_name].values.ravel()
+
+        x, b_in, b_pred, b_imp = binned_bias_curves(target, inp, pred, nbins)
+        if x.size == 0:
             continue
 
-        tgt_v = collated[tgt_key].values.flatten()
-        in_v  = collated[in_key].values.flatten()
-        prd_v = collated[prd_key].values.flatten()
-        mask  = np.isfinite(tgt_v) & np.isfinite(in_v) & np.isfinite(prd_v)
-        tgt_v, in_v, prd_v = tgt_v[mask], in_v[mask], prd_v[mask]
+        fig = plt.figure(figsize=(10, 8), constrained_layout=True)
+        gs = fig.add_gridspec(3, 1, height_ratios=[2, 2, 1])
+        ax_top = fig.add_subplot(gs[:2, 0])
+        ax_bot = fig.add_subplot(gs[2, 0], sharex=ax_top)
 
-        std_ref = float(np.std(tgt_v)) + 1e-8
-        ref_std = 1.0
+        ax_top.plot(x, b_in,   marker="o", label="Input bias",     color="tab:orange")
+        ax_top.plot(x, b_pred, marker="o", label="Prediction bias", color="tab:blue")
+        ax_top.axhline(0.0, color="k", linestyle="--", linewidth=1)
+        ax_top.set_ylabel("Bias (value - target)")
+        ax_top.set_title(f"Reliability-style Bias Curves: {cfg['label']} (95% range)")
+        ax_top.grid(alpha=0.3)
+        ax_top.legend()
 
-        def point(x):
-            r   = float(np.corrcoef(tgt_v, x)[0, 1])
-            std = float(np.std(x)) / std_ref
-            return std, r
+        ax_bot.plot(x, b_imp, marker="o", color="tab:green")
+        ax_bot.axhline(0.0, color="k", linestyle="--", linewidth=1)
+        ax_bot.set_xlabel("Target value bins (2.5%-97.5%)")
+        ax_bot.set_ylabel("|input| - |pred|")
+        ax_bot.set_title("Bias improvement (>0 better)")
+        ax_bot.grid(alpha=0.3)
 
-        in_std,  in_r  = point(in_v)
-        prd_std, prd_r = point(prd_v)
-
-        angles = np.linspace(0, np.pi / 2, 181)
-        fig, ax = plt.subplots(figsize=(6, 6), subplot_kw={"polar": True})
-        ax.set_thetamax(90)
-
-        # Concentric std circles
-        for s in [0.5, 1.0, 1.5, 2.0]:
-            ax.plot(angles, np.full_like(angles, s), "gray", lw=0.5, ls="--")
-        # Reference point
-        ax.plot(0, ref_std, "k*", ms=12, label="Reference (ERA5)")
-        # Input
-        ax.plot(np.arccos(in_r), in_std, "b^", ms=10, label=f"Input  r={in_r:.2f}")
-        # Prediction
-        ax.plot(np.arccos(prd_r), prd_std, "rs", ms=10, label=f"Pred   r={prd_r:.2f}")
-
-        ax.set_title(f"{cfg['label']} – Taylor diagram", pad=18)
-        ax.legend(loc="upper right", bbox_to_anchor=(1.28, 1.1), fontsize=8)
-        plt.tight_layout()
-        plt.savefig(output_dir / f"taylor_{key}.png", dpi=dpi, bbox_inches="tight")
-        plt.close()
+        out_path = rel_dir / f"{key}_reliability_bias.png"
+        fig.savefig(out_path, dpi=dpi)
+        plt.close(fig)
 
 
-# ── per-lead analysis ─────────────────────────────────────────────────────────
+def create_scatter_plots(collated: xr.Dataset, output_dir: Path, dpi: int = 200) -> None:
+    scat_dir = output_dir / "scatter"
+    scat_dir.mkdir(parents=True, exist_ok=True)
 
-def plot_per_lead_metrics(collated: xr.Dataset, output_dir: Path, dpi: int = 200):
-    """RMSE / bias as a function of lead month."""
-    if "lead_month" not in collated.coords:
+    for key, cfg in VAR_CONFIG.items():
+        input_name  = f"{key}_input_monthly"
+        target_name = f"{key}_target_monthly"
+        pred_name   = f"{key}_pred_monthly"
+
+        target = collated[target_name].values.ravel()
+        inp    = collated[input_name].values.ravel()
+        pred   = collated[pred_name].values.ravel()
+
+        mask1 = np.isfinite(target) & np.isfinite(inp)
+        mask2 = np.isfinite(target) & np.isfinite(pred)
+
+        x1, y1 = target[mask1], inp[mask1]
+        x2, y2 = target[mask2], pred[mask2]
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
+
+        axes[0].scatter(x1, y1, s=3, alpha=0.2, color="tab:orange")
+        axes[0].set_title(f"Input vs Target ({cfg['label']})")
+        axes[0].set_xlabel("Target")
+        axes[0].set_ylabel("Input")
+        axes[0].grid(alpha=0.3)
+
+        axes[1].scatter(x2, y2, s=3, alpha=0.2, color="tab:blue")
+        axes[1].set_title(f"Prediction vs Target ({cfg['label']})")
+        axes[1].set_xlabel("Target")
+        axes[1].set_ylabel("Prediction")
+        axes[1].grid(alpha=0.3)
+
+        # Precipitation axis limit at 90th percentile to reduce outlier impact
+        if key == "tp":
+            pooled = np.concatenate([x1, y1, x2, y2])
+            pooled = pooled[np.isfinite(pooled)]
+            if pooled.size > 0:
+                q90 = float(np.percentile(pooled, 90.0))
+                lim_min = 0.0
+                lim_max = max(q90, 1e-6)
+                for ax in axes:
+                    ax.set_xlim(lim_min, lim_max)
+                    ax.set_ylim(lim_min, lim_max)
+
+        # 1:1 line
+        for ax in axes:
+            xmin, xmax = ax.get_xlim()
+            ymin, ymax = ax.get_ylim()
+            lo = min(xmin, ymin)
+            hi = max(xmax, ymax)
+            ax.plot([lo, hi], [lo, hi], "k--", linewidth=1)
+
+        out_path = scat_dir / f"{key}_scatter.png"
+        fig.savefig(out_path, dpi=dpi)
+        plt.close(fig)
+
+
+def create_qq_plots(
+    collated: xr.Dataset,
+    output_dir: Path,
+    n_quantiles: int = 500,
+    dpi: int = 200,
+) -> None:
+    """Q-Q plots of input-vs-target and prediction-vs-target on one shared axis.
+
+    Both curves share the same x-axis (target quantiles); the input quantiles
+    are drawn in orange and the prediction quantiles in blue.  A black dashed
+    1:1 reference line marks perfect agreement.
+    """
+    qq_dir = output_dir / "qq_plots"
+    qq_dir.mkdir(parents=True, exist_ok=True)
+
+    probs = np.linspace(0.0, 100.0, n_quantiles)
+
+    for key, cfg in VAR_CONFIG.items():
+        input_name  = f"{key}_input_monthly"
+        target_name = f"{key}_target_monthly"
+        pred_name   = f"{key}_pred_monthly"
+
+        target = collated[target_name].values.ravel()
+        inp    = collated[input_name].values.ravel()
+        pred   = collated[pred_name].values.ravel()
+
+        mask = np.isfinite(target) & np.isfinite(inp) & np.isfinite(pred)
+        if mask.sum() < 10:
+            continue
+
+        tgt_q  = np.percentile(target[mask], probs)
+        inp_q  = np.percentile(inp[mask],    probs)
+        pred_q = np.percentile(pred[mask],   probs)
+
+        all_vals = np.concatenate([tgt_q, inp_q, pred_q])
+        lo, hi = float(np.nanmin(all_vals)), float(np.nanmax(all_vals))
+        pad = (hi - lo) * 0.03
+        lo -= pad
+        hi += pad
+
+        fig, ax = plt.subplots(figsize=(7, 6), constrained_layout=True)
+        ax.plot(tgt_q, inp_q,  color="tab:orange", linewidth=1.5, label="Input vs Target")
+        ax.plot(tgt_q, pred_q, color="tab:blue",   linewidth=1.5, label="Prediction vs Target")
+        ax.plot([lo, hi], [lo, hi], "k--", linewidth=1.0, label="1:1 (perfect)")
+
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel(f"Target quantiles ({cfg['units']})")
+        ax.set_ylabel(f"Field quantiles ({cfg['units']})")
+        ax.set_title(f"Q-Q plot: {cfg['label']}")
+        ax.legend(framealpha=0.85)
+        ax.grid(alpha=0.3)
+
+        out_path = qq_dir / f"{key}_qq.png"
+        fig.savefig(out_path, dpi=dpi)
+        plt.close(fig)
+
+
+def _stats_for_taylor(target: np.ndarray, field: np.ndarray) -> Tuple[float, float]:
+    mask = np.isfinite(target) & np.isfinite(field)
+    t = target[mask]
+    f = field[mask]
+    if t.size < 2:
+        return np.nan, np.nan
+
+    t_std = np.std(t)
+    f_std = np.std(f)
+    corr  = np.corrcoef(t, f)[0, 1]
+
+    if np.isclose(t_std, 0.0):
+        return np.nan, np.nan
+
+    std_ratio = f_std / t_std
+    corr = np.clip(corr, -1.0, 1.0)
+    return std_ratio, corr
+
+
+def create_taylor_diagram_for_variable(
+    collated: xr.Dataset,
+    key: str,
+    output_path: Path,
+    dpi: int = 200,
+) -> None:
+    cfg         = VAR_CONFIG[key]
+    input_name  = f"{key}_input_monthly"
+    target_name = f"{key}_target_monthly"
+    pred_name   = f"{key}_pred_monthly"
+
+    target = collated[target_name].values.ravel()
+    inp    = collated[input_name].values.ravel()
+    pred   = collated[pred_name].values.ravel()
+
+    in_std_ratio, in_corr = _stats_for_taylor(target, inp)
+    pr_std_ratio, pr_corr = _stats_for_taylor(target, pred)
+
+    if not all(np.isfinite(v) for v in (in_std_ratio, in_corr, pr_std_ratio, pr_corr)):
         return
 
-    unique_leads = sorted(int(x) for x in np.unique(collated.lead_month.values))
-    if len(unique_leads) < 2:
-        return
+    theta_input = np.arccos(in_corr)
+    theta_pred  = np.arccos(pr_corr)
+    r_max       = max(1.6, in_std_ratio, pr_std_ratio) * 1.15
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    axes = axes.flatten()
+    fig = plt.figure(figsize=(7, 6), constrained_layout=True)
+    ax  = fig.add_subplot(111, projection="polar")
 
-    for ax_i, (key, cfg) in enumerate(VAR_CONFIG.items()):
-        ax     = axes[ax_i]
-        tgt_k  = f"{key}_target_monthly"
-        prd_k  = f"{key}_pred_monthly"
-        if not all(k in collated for k in (tgt_k, prd_k)):
-            continue
+    ax.set_theta_direction(-1)
+    ax.set_theta_offset(np.pi / 2)
+    ax.set_thetamin(0)
+    ax.set_thetamax(180)
+    ax.set_rlim(0, r_max)
 
-        rmse_per_lead = []
-        bias_per_lead = []
-        for lm in unique_leads:
-            sel = collated.sel(combo=(collated.lead_month == lm))
-            tgt = sel[tgt_k].values.flatten()
-            prd = sel[prd_k].values.flatten()
-            mask = np.isfinite(tgt) & np.isfinite(prd)
-            if mask.sum() < 2:
-                rmse_per_lead.append(np.nan)
-                bias_per_lead.append(np.nan)
-                continue
-            rmse_per_lead.append(float(np.sqrt(np.mean((prd[mask] - tgt[mask])**2))))
-            bias_per_lead.append(float(np.mean(prd[mask] - tgt[mask])))
-
-        ax.plot(unique_leads, rmse_per_lead, "r-o", label="RMSE", ms=6)
-        ax.plot(unique_leads, bias_per_lead, "b-s", label="Bias", ms=6)
-        ax.axhline(0, color="k", lw=0.8, ls="--")
-        ax.set_xlabel("Lead month"); ax.set_ylabel(cfg["units"])
-        ax.set_title(f"{cfg['label']} – metrics by lead month")
-        ax.legend(); ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(output_dir / "metrics_by_lead_month.png", dpi=dpi, bbox_inches="tight")
-    plt.close()
-
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Aggregate and visualise seasonal inference NetCDF outputs"
+    corr_ticks  = np.array([0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
+    theta_ticks = np.arccos(np.clip(corr_ticks, -1, 1))
+    ax.set_thetagrids(
+        np.degrees(theta_ticks),
+        labels=[f"{c:.2f}" for c in corr_ticks],
     )
-    parser.add_argument("--input-dir",        required=True)
-    parser.add_argument("--output-dir",        default=None)
-    parser.add_argument("--pattern",           default="inference_member_*_lead_*.nc")
-    parser.add_argument("--reliability-bins",  type=int, default=20)
-    parser.add_argument("--dpi",               type=int, default=200)
-    return parser.parse_args()
+    ax.set_title(
+        f"Taylor Diagram: {cfg['label']}\n"
+        "(angle=correlation, radius=std ratio)"
+    )
+
+    ax.plot(0,            1.0,         "k*", markersize=12, label="Target (ref)")
+    ax.plot(theta_input, in_std_ratio,  "o",  color="tab:orange", markersize=9, label="Input")
+    ax.plot(theta_pred,  pr_std_ratio,  "o",  color="tab:blue",   markersize=9, label="Prediction")
+
+    ax.legend(loc="upper right", bbox_to_anchor=(1.25, 1.1))
+    fig.savefig(output_path, dpi=dpi)
+    plt.close(fig)
 
 
-def main():
+def create_taylor_diagrams(collated: xr.Dataset, output_dir: Path, dpi: int = 200) -> None:
+    taylor_dir = output_dir / "taylor"
+    taylor_dir.mkdir(parents=True, exist_ok=True)
+
+    for key in VAR_CONFIG:
+        out_path = taylor_dir / f"{key}_taylor.png"
+        create_taylor_diagram_for_variable(collated, key, out_path, dpi=dpi)
+
+
+def main() -> None:
     args = parse_args()
 
-    input_dir  = Path(args.input_dir).resolve()
-    output_dir = Path(args.output_dir).resolve() if args.output_dir \
-                 else (input_dir / "analysis")
+    input_dir = Path(args.input_dir).resolve()
+    if not input_dir.exists():
+        raise FileNotFoundError(f"Input directory not found: {input_dir}")
+
+    output_dir = (
+        Path(args.output_dir).resolve() if args.output_dir
+        else (input_dir / "analysis")
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     files = sorted(input_dir.glob(args.pattern))
     if not files:
         raise FileNotFoundError(
-            f"No files matching '{args.pattern}' in {input_dir}"
+            f"No inference NetCDF files found in {input_dir} "
+            f"with pattern '{args.pattern}'"
         )
-    print(f"Found {len(files)} inference files")
 
-    # ── collate monthly aggregates ────────────────────────────────────────────
-    print("Computing monthly aggregates …")
+    print(f"Found {len(files)} files")
+
     collated = collate_monthly(files)
-
-    collated_path = output_dir / "collated_monthly.nc"
+    collated_path = output_dir / "monthly_collated.nc"
     save_collated(collated, collated_path)
-    print(f"Collated monthly data → {collated_path}")
+    print(f"Saved collated monthly NetCDF: {collated_path}")
 
-    # ── plots ─────────────────────────────────────────────────────────────────
-    print("Generating spatial maps …")
-    plot_spatial_panels(collated, output_dir, dpi=args.dpi)
+    create_six_panel_maps(collated, output_dir=output_dir, dpi=args.dpi)
+    print(f"Saved six-panel maps in: {output_dir / 'maps_6panel'}")
 
-    print("Generating scatter plots …")
-    plot_scatter(collated, output_dir, dpi=args.dpi)
+    create_reliability_plots(
+        collated,
+        output_dir=output_dir,
+        nbins=args.reliability_bins,
+        dpi=args.dpi,
+    )
+    print(f"Saved reliability plots in: {output_dir / 'reliability'}")
 
-    print("Generating reliability bias plots …")
-    plot_reliability_bias(collated, output_dir,
-                          n_bins=args.reliability_bins, dpi=args.dpi)
+    create_scatter_plots(collated, output_dir=output_dir, dpi=args.dpi)
+    print(f"Saved scatter plots in: {output_dir / 'scatter'}")
 
-    print("Generating Taylor diagrams …")
-    plot_taylor_diagram(collated, output_dir, dpi=args.dpi)
+    create_taylor_diagrams(collated, output_dir=output_dir, dpi=args.dpi)
+    print(f"Saved Taylor diagrams in: {output_dir / 'taylor'}")
 
-    print("Generating per-lead-month metrics …")
-    plot_per_lead_metrics(collated, output_dir, dpi=args.dpi)
-
-    print(f"All outputs saved → {output_dir}")
+    create_qq_plots(collated, output_dir=output_dir, dpi=args.dpi)
+    print(f"Saved Q-Q plots in: {output_dir / 'qq_plots'}")
 
 
 if __name__ == "__main__":

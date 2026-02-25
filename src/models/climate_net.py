@@ -34,6 +34,7 @@ class ClimateNet(nn.Module):
         num_leads: int = 11,
         lead_embed_dim: int = 128,
         dilations: List[int] = None,
+        padding_mode: str = 'zeros',
     ):
         super().__init__()
 
@@ -70,6 +71,7 @@ class ClimateNet(nn.Module):
                 num_leads=num_leads,
                 lead_embed_dim=lead_embed_dim,
                 dilations=dilations,
+                padding_mode=padding_mode,
             )
 
         else:
@@ -83,6 +85,7 @@ class ClimateNet(nn.Module):
                 hidden_dims=decoder_hidden_dims,
                 output_size=image_size,
                 output_activations=output_activations,
+                padding_mode=padding_mode,
             )
         else:  # "multi" (default) — one independent decoder per variable
             self.decoder = MultiDecoder(
@@ -91,6 +94,7 @@ class ClimateNet(nn.Module):
                 hidden_dims=decoder_hidden_dims,
                 output_size=image_size,
                 output_activations=output_activations,
+                padding_mode=padding_mode,
             )
 
         # Initialize weights for encoder and decoder
@@ -107,7 +111,20 @@ class ClimateNet(nn.Module):
             )
 
     def _init_weights(self, m):
-        """Initialize network weights."""
+        """Initialize network weights (Conv2d and BatchNorm2d only).
+
+        Intentionally does NOT touch nn.Linear modules for two reasons:
+        1. The decoder has no Linear layers (Conv2d + BN only), so there is
+           nothing to initialise here.
+        2. Linear layers that DO exist are either:
+           a) FiLM gamma/beta MLPs — already initialised to (γ=1, β=0)
+              identity in FiLMLayer.__init__; overwriting would reset γ→0
+              and break lead-time conditioning from the start.
+           b) ViT transformer-block attention and MLP projections — already
+              initialised with xavier_uniform_ / trunc_normal_(0.02) by
+              VisionTransformerEncoder._init_weights(); overwriting with
+              normal_(0, 0.01) undoes that careful init.
+        """
         if isinstance(m, nn.Conv2d):
             nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="leaky_relu")
             if m.bias is not None:
@@ -115,10 +132,6 @@ class ClimateNet(nn.Module):
         elif isinstance(m, nn.BatchNorm2d):
             nn.init.constant_(m.weight, 1)
             nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, 0, 0.01)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
 
     def forward(
         self, static: torch.Tensor, dynamic: torch.Tensor, lead_indices: torch.Tensor

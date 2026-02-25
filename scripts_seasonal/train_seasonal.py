@@ -445,6 +445,7 @@ def main(rank: int, world_size: int, config_path: str, resume_path: str = None,
         num_leads         = config["model"]["num_leads"],
         lead_embed_dim    = config["model"]["lead_embed_dim"],
         dilations         = config["model"].get("dilations", None),
+        padding_mode      = config["model"].get("padding_mode", "zeros"),
     ).to(device)
 
     if world_size > 1:

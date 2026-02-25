@@ -1,0 +1,128 @@
+# exp_s02_cnn_reflect_seasonal.yml
+# ──────────────────────────────────────────────────────────────────────────────
+# EXPERIMENT S02 — Seasonal CNN with reflect padding to eliminate boundary artefacts
+#
+# Based on exp_s01 (Tweedie loss, CNN encoder) but replaces zero padding in all
+# Conv2d layers with reflect padding.
+#
+# Motivation — spatial artefacts in exp_s01 outputs:
+#   • Vertical line on the left edge of the domain
+#   • Horizontal lines along the bottom
+#   • Corner blobs where two zero-padded edges meet
+#
+# Root cause:
+#   The model uses 5 encoder residual blocks + 4 decoder conv layers, all with
+#   3×3 kernels and zero padding.  On a 28×53 grid the effective receptive field
+#   spans ~11 pixels from every edge.  Zero-padding injects artificial zeros at
+#   the domain boundary, so the network learns systematic bias-corrections at
+#   those edges that manifest as the visible lines/blobs in predictions.
+#
+# Fix — padding_mode: reflect
+#   Reflect padding mirrors real interior values across the boundary instead of
+#   injecting zeros.  This gives the network a physically more plausible view of
+#   the domain edges and removes the systematic boundary bias.
+#   Circular padding would be ideal for the longitude axis (periodic geography)
+#   but incorrect for latitude; reflect is the best single-mode choice that
+#   handles both axes correctly for a limited-area domain like Cyprus.
+#
+# All other settings are identical to exp_s01 for direct comparison.
+# ──────────────────────────────────────────────────────────────────────────────
+
+experiment:
+  name: "cnn_reflect_seasonal"
+  base_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments"
+  output_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments_seasonal/exp_s02_cnn_reflect_seasonal"
+  description: "Seasonal bias-correction — Tweedie loss + reflect padding to fix boundary artefacts"
+
+seed: 42
+
+data:
+  nc_path: "/nvme/h/pgeorgiades/scratch/training_seasonal.nc"
+  cache_dir: "./cache"
+  load_in_memory: true
+  rank0_only_in_memory_load: false
+  rank0_batch_broadcast: false
+  normalize: true
+  normalize_samples: null   # null = use all training samples
+  normalize_method: "minmax"
+  # ── year splits (matches existing seasonal UNet params.json) ─────────────
+  train_years: [1981, 1982, 1983, 1984, 1985, 1986, 1987, 1988, 1989,
+                1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999,
+                2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009,
+                2010, 2011, 2012, 2013]
+  val_years:   [2014, 2015, 2016]
+  test_years:  [2017, 2018, 2019, 2020]
+  num_workers: 12
+
+model:
+  static_channels: 3          # dem, rho, phi
+  dynamic_channels: 16        # tp, t2m, tmax, hurs, sin_t, cos_t, cci×10
+  image_size: [28, 53]        # seasonal grid: 28 lat × 53 lon
+  encoder_type: "cnn"
+  encoder_dim: 512
+  encoder_blocks: 5
+  decoder_type: "multi"
+  decoder_hidden_dims: [512, 256, 128, 64]
+  target_vars: ["tasERA", "tasmaxERA", "tpERA", "rhERA"]
+  output_activations:
+    tpERA: "softplus"         # ensures mu > 0, required by Tweedie
+  use_film: true
+  num_leads: 7                # lead months 0, 1, 2, 3, 4, 5, 6
+  lead_embed_dim: 128
+  # ── key change vs exp_s01 ────────────────────────────────────────────────
+  padding_mode: "reflect"     # replaces zero-padding to eliminate boundary artefacts
+
+optimizer:
+  type: "adamw"
+  lr: !!float 1e-5
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+scheduler:
+  type: "cosine"
+  min_lr: !!float 1e-7
+  factor: 0.5
+  patience: 5
+  step_size: 30
+  gamma: 0.1
+
+training:
+  batch_size: 256
+  max_epochs: 100
+  stage1_epochs: 50
+  gradient_clip_val: 1.0
+  early_stopping_patience: 15
+  save_every_n_epochs: 5
+  val_interval: 1
+  use_amp: true
+  device: "cuda"
+
+loss:
+  weighting_strategy: equal
+  data_loss_types:
+    tasERA:    hybrid
+    tasmaxERA: hybrid
+    tpERA:     tweedie         # Tweedie deviance (compound Poisson-Gamma MLE)
+    rhERA:     hybrid
+  # Tweedie params
+  tweedie_power: 1.5           # midpoint between Poisson (1) and Gamma (2)
+  tweedie_eps: !!float 1e-6
+  # compositedry / wethybrid params kept but unused for tpERA
+  compositedry_gamma: 1.0
+  compositedry_overestimate_weight: 2.5
+  compositedry_dry_threshold: 0.002
+  compositedry_lambda_extreme: 1.0
+  compositedry_lambda_dry: 0.7
+  wet_weight: 10.0
+  dry_weight: 1.0
+  use_physics: false
+  physics_weight: 0.0
+  use_clausius_clapeyron: false
+  use_temp_consistency: false
+  use_humidity_bounds: false
+  use_precip_nonnegativity: false
+  use_spatial_smoothness: false
+
+logging:
+  log_level: "INFO"
+  log_interval: 50

@@ -7,7 +7,7 @@
 #SBATCH -A p236
 #SBATCH --ntasks-per-node=20
 #SBATCH --gres=gpu:2
-#SBATCH --mem=240G
+#SBATCH --mem=290G
 #SBATCH -p a100
 #SBATCH --chdir=/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/code
 

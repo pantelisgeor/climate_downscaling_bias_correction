@@ -69,6 +69,7 @@ model:
   use_film: true
   num_leads: 11
   lead_embed_dim: 128
+  padding_mode: "reflect" 
 
 optimizer:
   type: "adamw"

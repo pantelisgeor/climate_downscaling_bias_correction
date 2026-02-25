@@ -1,0 +1,117 @@
+# exp_d01_cnn_tweedie.yml
+# ──────────────────────────────────────────────────────────────────────────────
+# EXPERIMENT D01 — High-resolution downscaling, Tweedie loss (p=1.5)
+#
+# Analogue of exp_11_cnn_tweedie_precip.yml adapted for the 1.6 TB
+# disk-streaming downscaling dataset (270×520 grid, 738k daily samples,
+# 6 ensemble runs × 11 lead times, 1981-2020).
+#
+# Key differences from exp_11:
+#   • data_dir/cache_dir instead of nc_path  (disk-based loader)
+#   • No load_in_memory / rank0_only_in_memory_load  (always disk)
+#   • Normalization pre-computed from per-year minmax CSVs — no fit step
+#   • image_size [270, 520] vs [35, 77]
+#   • batch_size 4 (reduce if OOM; increase if memory allows)
+#   • encoder_dim 256 (reduced from 512 for the larger spatial footprint;
+#     feature maps scale as H*W so halving encoder_dim saves 4× memory)
+#   • num_workers 4 (LRU file handles are process-safe across workers)
+#   • dilations set for larger receptive field on the larger grid
+# ──────────────────────────────────────────────────────────────────────────────
+
+experiment:
+  name: "dec_downscale_tweedie"
+  base_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments"
+  output_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments_dec_downscale/exp_d01_dec_downscale_tweedie"
+  description: "High-res decadal downscaling — Tweedie deviance (p=1.5) for tpERA"
+
+seed: 42
+
+data:
+  data_dir: "/nvme/h/pgeorgiades/scratch/decadal_downscale/"
+  cache_dir: "/nvme/h/pgeorgiades/scratch/downscale_cache/"
+  force_reindex: false
+  # Normalization is loaded from per-year minmax CSVs (train years only).
+  # No in-memory loading option — all ranks stream from disk.
+  train_years: [1981, 1982, 1983, 1984, 1985, 1986, 1987, 1988, 1989,
+                1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999,
+                2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009,
+                2010, 2011, 2012]
+  val_years:  [2013, 2014, 2015, 2016]
+  test_years: [2017, 2018, 2019, 2020]
+  num_workers: 8
+
+model:
+  static_channels: 3          # dem, rho, phi
+  dynamic_channels: 16        # pr, tas, tasmax, hurs, sin_t, cos_t, cci×10
+  image_size: [270, 520]
+  encoder_type: "cnn"
+  encoder_dim: 256             # 512 works but may OOM; tune based on GPU mem
+  encoder_blocks: 6            # extra block for larger receptive field
+  decoder_type: "multi"
+  decoder_hidden_dims: [256, 128, 64, 32]
+  target_vars: ["tasERA", "tasmaxERA", "tpERA", "rhERA"]
+  output_activations:
+    tpERA: "softplus"          # ensures mu > 0 for Tweedie loss
+  use_film: true
+  num_leads: 11                # leads 0-10
+  lead_embed_dim: 128
+  padding_mode: "reflect"
+  dilations: [1, 2, 4, 8, 16, 1]   # larger RF for 270×520 spatial domain
+
+optimizer:
+  type: "adamw"
+  lr: !!float 1e-5
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+scheduler:
+  type: "cosine"
+  min_lr: !!float 1e-7
+  factor: 0.5
+  patience: 5
+  step_size: 30
+  gamma: 0.1
+
+training:
+  # A100 (40 GB): ~2.4 GB at bs=4; activations scale linearly.
+  # bs=32 → ~18 GB (well within 40 GB); bs=64 → ~36 GB (borderline).
+  batch_size: 6
+  max_epochs: 100
+  stage1_epochs: 50
+  gradient_clip_val: 1.0
+  early_stopping_patience: 15
+  save_every_n_epochs: 5
+  val_interval: 1
+  use_amp: true
+  device: "cuda"
+
+loss:
+  weighting_strategy: equal
+  data_loss_types:
+    tasERA:    hybrid
+    tasmaxERA: hybrid
+    tpERA:     tweedie         # Tweedie deviance (compound Poisson-Gamma MLE)
+    rhERA:     hybrid
+  tweedie_power: 1.5           # compound Poisson-Gamma midpoint
+  tweedie_eps: !!float 1e-6
+  compositedry_gamma: 1.0
+  compositedry_overestimate_weight: 2.5
+  compositedry_dry_threshold: 0.002
+  compositedry_lambda_extreme: 1.0
+  compositedry_lambda_dry: 0.7
+  wet_weight: 10.0
+  dry_weight: 1.0
+  use_physics: false
+  physics_weight: 0.0
+  use_clausius_clapeyron: false
+  use_temp_consistency: false
+  use_humidity_bounds: false
+  use_precip_nonnegativity: false
+  use_spatial_smoothness: false
+
+logging:
+  log_level: "INFO"
+  log_interval: 50
+
+evaluation:
+  save_predictions: true

@@ -4,11 +4,11 @@
 #SBATCH --error=/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/code/logs/%x_%j.err
 #SBATCH --time=24:00:00
 #SBATCH --nodes=1
-#SBATCH -A p236
+#SBATCH -A climate
 #SBATCH --ntasks-per-node=20
-#SBATCH --gres=gpu:2
-#SBATCH --mem=240G
-#SBATCH -p a100
+#SBATCH --gres=gpu:4
+#SBATCH --mem=185G
+#SBATCH -p gpu
 #SBATCH --chdir=/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/code
 
 # Ensure log directory exists before SLURM tries to open the output files

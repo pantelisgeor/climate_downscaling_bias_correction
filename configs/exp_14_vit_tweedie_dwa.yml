@@ -1,0 +1,181 @@
+# exp_14_vit_tweedie_dwa.yml
+# ──────────────────────────────────────────────────────────────────────────────
+# EXPERIMENT 14 — ViT encoder + Tweedie deviance (p=1.5) + DWA task weighting
+#
+# This is the decadal-data analogue of exp_s03 for the seasonal pipeline.
+# It extends the exp_11→exp_13 CNN progression by swapping the encoder for a
+# Vision Transformer with FiLM lead-time conditioning.
+#
+# Relationship to previous experiments:
+#   exp_11: CNN  + Tweedie (equal weights) — established Tweedie as best loss
+#   exp_13: CNN  + Tweedie + DWA           — DWA fixed T/RH dominating tpERA gradient
+#   exp_14: ViT  + Tweedie + DWA           — ← THIS EXPERIMENT
+#
+# Motivation for ViT on the decadal grid
+# ───────────────────────────────────────
+# The CNN encoder processes the 35×77 grid with local 3×3 convolutions; even
+# with dilations [1,2,4,8,16,1] the effective receptive field at the outermost
+# layers is ~35 pixels — barely spanning the full latitude extent of the domain.
+# Teleconnections relevant to Cyprus precipitation (e.g., East-Atlantic pattern,
+# NAO, Saharan heat transport) operate over the full grid simultaneously.
+#
+# ViT attention is non-local: every patch attends to every other patch in O(N²)
+# at each layer.  With N=55 patches (trivial sequence length) all 6 transformer
+# blocks operate over the full spatial context from the very first step.  This
+# is the key architectural advantage on a small (~3000 km²) limited-area domain
+# embedded in a much larger synoptic field.
+#
+# Patch-size choice for 35×77
+# ──────────────────────────────
+# patch_size=7 divides both dimensions exactly: 35/7=5, 77/7=11.
+# No edge cropping, no partial patches.  Sequence of 55 spatial tokens + CLS
+# token = 56 total.  This is the natural choice for the decadal grid (compare
+# seasonal 28×53 where 53 is prime and requires patch_size=4 with 1-column crop).
+#
+# Architecture details
+# ─────────────────────
+# PatchEmbedding:  Conv2d(19, 512, k=7, s=7) → [B, 55, 512] → LayerNorm
+# Positional enc:  learned, size [1, 56, 512] (55 patches + CLS)
+# Transformer:     6× Pre-LN blocks — norm→MultiheadAttn→residual,
+#                                     norm→GELU-MLP(2048)→residual
+# FiLM:            applied to [B, 512, 5, 11] after reshaping; γ=1, β=0 init
+#                  (created AFTER ClimateNet.apply() to protect ViT init)
+# Decoder:         4× independent heads, Conv2d [512→256→128→64→1] + bilinear
+#                  upsample [5,11]→[35,77]; reflect padding
+#
+# Weight initialisation fix (see src/models/climate_net.py _init_weights)
+# ────────────────────────────────────────────────────────────────────────
+# All prior ViT experiments suffered a silent bug: ClimateNet._init_weights
+# overwrote the careful ViT xavier_uniform_ / trunc_normal_(0.02) with a
+# weaker normal_(0, 0.01).  The fix (remove the nn.Linear branch from
+# _init_weights) was applied before this experiment was defined.  This is
+# therefore the first correctly-initialised ViT run on the decadal dataset.
+#
+# Key differences from exp_13 (CNN + Tweedie + DWA):
+#   encoder_type:          cnn → vit
+#   vit_patch_size:        (new) 7   — exact divisor of both 35 and 77
+#   vit_num_heads:         (new) 8   — 512 / 8 = 64 head-dim (ViT-B standard)
+#   vit_mlp_ratio:         (new) 4.0 — MLP hidden dim = 2048
+#   vit_dropout:           (new) 0.1
+#   vit_attention_dropout: (new) 0.1
+#   encoder_blocks:        5 → 6     — one extra block to compensate for
+#                                       smaller per-layer RF vs CNN with dilations
+#   dilations:             [1,2,4,8,16,1] → omitted (not used by ViT)
+#   batch_size:            200       — unchanged for direct comparability
+#   All other hyperparameters identical to exp_13.
+# ──────────────────────────────────────────────────────────────────────────────
+
+experiment:
+  name: "vit_tweedie_dwa"
+  base_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments"
+  output_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments/exp_14_vit_tweedie_dwa"
+  description: "ViT encoder + Tweedie deviance (p=1.5) + DWA task weighting — fully global spatial attention on 35×77 domain"
+
+seed: 42
+
+data:
+  nc_path: "/nvme/h/pgeorgiades/scratch/full_dataset.nc"
+  cache_dir: "./cache"
+  load_in_memory: true
+  rank0_only_in_memory_load: true
+  rank0_batch_broadcast: false
+  normalize: true
+  normalize_samples: 100000
+  normalize_method: "minmax"
+  train_years: [1981, 1982, 1983, 1984, 1985, 1986, 1987, 1988, 1989,
+                1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999,
+                2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009,
+                2010, 2011, 2012]
+  val_years: [2013, 2014, 2015, 2016]
+  test_years: [2017, 2018, 2019, 2020]
+  num_workers: 12
+
+model:
+  static_channels: 3          # dem, rho, phi
+  dynamic_channels: 16        # pr, tas, tasmax, hurs, sin_t, cos_t, cci×10
+  image_size: [35, 77]
+  encoder_type: "vit"
+  encoder_dim: 512             # same as all CNN expts; 512 / 8 heads = 64 head-dim ✓
+  encoder_blocks: 6            # +1 vs CNN (5): compensates for no dilated RF
+
+  # ── ViT-specific ─────────────────────────────────────────────────────────
+  # patch_size=7: 35/7=5 (exact), 77/7=11 (exact) — no edge cropping at all.
+  # Sequence: 5×11 = 55 spatial patches + 1 CLS = 56 tokens total.
+  vit_patch_size: 7
+  vit_num_heads: 8             # 512 / 8 = 64; standard ViT-B head dimension
+  vit_mlp_ratio: 4.0           # MLP hidden = 4 × 512 = 2048
+  vit_dropout: 0.1
+  vit_attention_dropout: 0.1
+
+  # ── decoder / shared settings ─────────────────────────────────────────────
+  decoder_type: "multi"
+  decoder_hidden_dims: [512, 256, 128, 64]
+  target_vars: ["tasERA", "tasmaxERA", "tpERA", "rhERA"]
+  output_activations:
+    tpERA: "softplus"          # smooth lower-bounded activation; required by Tweedie
+  use_film: true               # FiLM applied to ViT output [B, 512, 5, 11] after blocks
+  num_leads: 11                # leads 0–10
+  lead_embed_dim: 128
+  padding_mode: "reflect"      # decoder Conv2d; guards against edge artefacts
+  # dilations: omitted — not used by VisionTransformerEncoder
+
+optimizer:
+  type: "adamw"
+  lr: !!float 1e-5
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+scheduler:
+  type: "cosine"
+  min_lr: !!float 1e-7
+  factor: 0.5
+  patience: 5
+  step_size: 30
+  gamma: 0.1
+
+training:
+  # batch_size=200 kept identical to exp_11/exp_13 for direct comparison.
+  # ViT on 35×77 (56-token sequence) is cheaper than CNN: each transformer
+  # layer costs ~0.1 MB/sample; decoder activations [200, 512, 5, 11] ≈ 2 MB.
+  # Total per-GPU at B=200: <0.5 GB — trivial on A100.
+  batch_size: 200
+  max_epochs: 100
+  stage1_epochs: 50
+  gradient_clip_val: 1.0
+  early_stopping_patience: 15
+  save_every_n_epochs: 5
+  val_interval: 1
+  use_amp: true
+  device: "cuda"
+
+loss:
+  weighting_strategy: dwa          # DWA: re-weights tasks by loss rate-of-change;
+                                   # automatically boosts tpERA when T/RH converge faster
+  data_loss_types:
+    tasERA:    hybrid
+    tasmaxERA: hybrid
+    tpERA:     tweedie             # Tweedie deviance (compound Poisson-Gamma MLE)
+    rhERA:     hybrid
+  tweedie_power: 1.5               # midpoint between Poisson (1) and Gamma (2)
+  tweedie_eps: !!float 1e-6        # mu lower clamp to prevent log(0)
+  compositedry_gamma: 1.0
+  compositedry_overestimate_weight: 2.5
+  compositedry_dry_threshold: 0.002
+  compositedry_lambda_extreme: 1.0
+  compositedry_lambda_dry: 0.7
+  wet_weight: 10.0
+  dry_weight: 1.0
+  use_physics: false
+  physics_weight: 0.0
+  use_clausius_clapeyron: false
+  use_temp_consistency: false
+  use_humidity_bounds: false
+  use_precip_nonnegativity: false
+  use_spatial_smoothness: false
+
+logging:
+  log_level: "INFO"
+  log_interval: 50
+
+evaluation:
+  save_predictions: true

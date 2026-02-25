@@ -21,6 +21,7 @@ class Decoder(nn.Module):
         hidden_dims: List[int] = [512, 256, 128, 64],
         output_size: tuple = (35, 77),  # Target spatial size
         output_activation: str = "none",  # 'none', 'sigmoid', 'relu'
+        padding_mode: str = 'zeros',
     ):
         """
         Initialize decoder.
@@ -30,6 +31,7 @@ class Decoder(nn.Module):
             hidden_dims: List of hidden layer dimensions
             output_size: Target output spatial size (H, W)
             output_activation: Output activation function
+            padding_mode: Padding mode for Conv2d layers ('zeros', 'reflect', 'replicate', 'circular')
         """
         super().__init__()
 
@@ -41,7 +43,7 @@ class Decoder(nn.Module):
         for hidden_dim in hidden_dims:
             layers.extend(
                 [
-                    nn.Conv2d(in_dim, hidden_dim, 3, padding=1),
+                    nn.Conv2d(in_dim, hidden_dim, 3, padding=1, padding_mode=padding_mode),
                     nn.BatchNorm2d(hidden_dim),
                     nn.LeakyReLU(0.2, inplace=True),
                 ]
@@ -110,6 +112,7 @@ class SharedDecoder(nn.Module):
         hidden_dims: List[int] = [512, 256, 128, 64],
         output_size: tuple = (35, 77),
         output_activations: Dict[str, str] = None,
+        padding_mode: str = 'zeros',
     ):
         """
         Initialize shared decoder.
@@ -121,6 +124,7 @@ class SharedDecoder(nn.Module):
             output_size: Target output spatial size (H, W)
             output_activations: Dict mapping variable names to activation
                                  ('none', 'relu', 'sigmoid')
+            padding_mode: Padding mode for Conv2d layers ('zeros', 'reflect', 'replicate', 'circular')
         """
         super().__init__()
 
@@ -138,7 +142,7 @@ class SharedDecoder(nn.Module):
         for hidden_dim in hidden_dims:
             layers.extend(
                 [
-                    nn.Conv2d(in_dim, hidden_dim, 3, padding=1),
+                    nn.Conv2d(in_dim, hidden_dim, 3, padding=1, padding_mode=padding_mode),
                     nn.BatchNorm2d(hidden_dim),
                     nn.LeakyReLU(0.2, inplace=True),
                 ]
@@ -200,6 +204,7 @@ class MultiDecoder(nn.Module):
         hidden_dims: List[int] = [512, 256, 128, 64],
         output_size: tuple = (35, 77),
         output_activations: Dict[str, str] = None,
+        padding_mode: str = 'zeros',
     ):
         """
         Initialize multi-decoder.
@@ -210,6 +215,7 @@ class MultiDecoder(nn.Module):
             hidden_dims: Hidden dimensions for each decoder
             output_size: Target output spatial size (H, W)
             output_activations: Dictionary mapping variable names to activations
+            padding_mode: Padding mode for Conv2d layers ('zeros', 'reflect', 'replicate', 'circular')
         """
         super().__init__()
 
@@ -231,6 +237,7 @@ class MultiDecoder(nn.Module):
                 hidden_dims=hidden_dims,
                 output_size=output_size,
                 output_activation=activation,
+                padding_mode=padding_mode,
             )
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:

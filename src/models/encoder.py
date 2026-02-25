@@ -19,14 +19,15 @@ class ResidualBlock(nn.Module):
         use_film: bool = True,
         lead_embed_dim: int = 128,
         dilation: int = 1,
+        padding_mode: str = 'zeros',
     ):
         super().__init__()
 
         self.use_film = use_film
 
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=dilation, dilation=dilation)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=dilation, dilation=dilation, padding_mode=padding_mode)
         self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=dilation, dilation=dilation)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=dilation, dilation=dilation, padding_mode=padding_mode)
         self.bn2 = nn.BatchNorm2d(out_channels)
 
         # Skip connection
@@ -81,6 +82,7 @@ class CNNEncoder(nn.Module):
         num_leads: int = 11,
         lead_embed_dim: int = 128,
         dilations: List[int] = None,
+        padding_mode: str = 'zeros',
     ):
         """
         Initialize CNN encoder.
@@ -95,6 +97,7 @@ class CNNEncoder(nn.Module):
             num_leads: Number of lead time values
             lead_embed_dim: Lead time embedding dimension
             dilations: List of dilations for each block (optional)
+            padding_mode: Padding mode for Conv2d layers ('zeros', 'reflect', 'replicate', 'circular')
         """
         super().__init__()
 
@@ -112,20 +115,20 @@ class CNNEncoder(nn.Module):
 
         # Static feature encoder
         self.static_encoder = nn.Sequential(
-            nn.Conv2d(static_channels, base_channels, 3, padding=1),
+            nn.Conv2d(static_channels, base_channels, 3, padding=1, padding_mode=padding_mode),
             nn.BatchNorm2d(base_channels),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(base_channels, base_channels * 2, 3, padding=1),
+            nn.Conv2d(base_channels, base_channels * 2, 3, padding=1, padding_mode=padding_mode),
             nn.BatchNorm2d(base_channels * 2),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(base_channels * 2, base_channels * 2, 3, padding=1),
+            nn.Conv2d(base_channels * 2, base_channels * 2, 3, padding=1, padding_mode=padding_mode),
             nn.BatchNorm2d(base_channels * 2),
             nn.LeakyReLU(0.2, inplace=True),
         )
 
         # Dynamic feature encoder (with FiLM)
         dynamic_layers = [
-            nn.Conv2d(dynamic_channels, base_channels, 3, padding=1),
+            nn.Conv2d(dynamic_channels, base_channels, 3, padding=1, padding_mode=padding_mode),
             nn.BatchNorm2d(base_channels),
             nn.LeakyReLU(0.2, inplace=True),
         ]
@@ -152,7 +155,7 @@ class CNNEncoder(nn.Module):
             )
 
             self.dynamic_blocks.append(
-                ResidualBlock(in_ch, out_ch, use_film, lead_embed_dim, dilation=dilations[i])
+                ResidualBlock(in_ch, out_ch, use_film, lead_embed_dim, dilation=dilations[i], padding_mode=padding_mode)
             )
 
         self.dynamic_init = nn.Sequential(*dynamic_layers)

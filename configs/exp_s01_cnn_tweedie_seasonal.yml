@@ -34,7 +34,7 @@ data:
   nc_path: "/nvme/h/pgeorgiades/scratch/training_seasonal.nc"
   cache_dir: "./cache"
   load_in_memory: true
-  rank0_only_in_memory_load: false   # single GPU — no asymmetric DDP loading
+  rank0_only_in_memory_load: false
   rank0_batch_broadcast: false
   normalize: true
   normalize_samples: null   # null = use all training samples
@@ -63,6 +63,7 @@ model:
   use_film: true
   num_leads: 7                # lead months 0, 1, 2, 3, 4, 5, 6
   lead_embed_dim: 128
+  padding_mode: "reflect" 
 
 optimizer:
   type: "adamw"

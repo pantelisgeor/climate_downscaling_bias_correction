@@ -4,8 +4,9 @@ Inference script for seasonal ClimateNet.
 Adapted from scripts/infer.py.  Key differences:
   • Uses SeasonalDataLoader / ClimateDatasetSeasonal
   • Forecast variable names are  tp, t2m, tmax, hurs  (not pr, tas, tasmax, hurs)
-  • Outputs are grouped by (member_number, lead_month)
-  • Output NetCDF files are named  inference_member_{N}_lead_{L}.nc
+  • Outputs are grouped by (lead_month, year) with all 25 ensemble members
+    stacked along a 'member' dimension
+  • Output NetCDF files are named  inference_lead_{L}_year_{Y}.nc
 """
 
 import argparse
@@ -55,19 +56,20 @@ def parse_years(year_text: str) -> List[int]:
     return sorted(years)
 
 
-def get_year_from_time_index(data_loader: SeasonalDataLoader, time_idx: int) -> int:
-    return pd.Timestamp(data_loader.ds.time.values[time_idx]).year
-
-
 def get_indices_for_years(data_loader: SeasonalDataLoader,
                           selected_years: List[int]) -> List[int]:
+    """Return positional indices into valid_combinations whose time year is in selected_years.
+
+    Uses data_loader._np_times (always in memory, even when load_in_memory=True
+    closes the xarray Dataset) and vectorised numpy operations for speed.
+    """
     wanted = set(selected_years)
-    combos = data_loader.valid_combinations
-    return [
-        idx for idx in range(len(combos))
-        if get_year_from_time_index(data_loader, int(combos.iloc[idx]["time_idx"]))
-        in wanted
-    ]
+    # _np_times is a (n_time,) datetime64 array set during __init__
+    time_years = pd.DatetimeIndex(data_loader._np_times).year.to_numpy()
+    # _vc_time_idx is a (N,) int32 array of time indices per valid combination
+    sample_years = time_years[data_loader._vc_time_idx]
+    mask = np.isin(sample_years, list(wanted))
+    return list(np.where(mask)[0])
 
 
 def sanitize_filename(text: str) -> str:
@@ -125,6 +127,8 @@ def build_model(config: dict, device: str) -> ClimateNet:
         use_film           = config["model"]["use_film"],
         num_leads          = config["model"]["num_leads"],
         lead_embed_dim     = config["model"]["lead_embed_dim"],
+        dilations          = config["model"].get("dilations", None),
+        padding_mode       = config["model"].get("padding_mode", "zeros"),
     ).to(device)
 
 
@@ -250,6 +254,7 @@ def main():
 
     target_vars = config["model"]["target_vars"]
     H, W = tuple(config["model"]["image_size"])
+    # grouped[(lead_month, year)][member_number] = {times, inputs, targets, preds}
     grouped: Dict = {}
     processed = 0
 
@@ -281,30 +286,31 @@ def main():
             raw_inputs = raw_inputs.reshape(19, H, W).astype(np.float32)
             raw_tgts   = raw_tgts.reshape(4, H, W).astype(np.float32)
 
-            combo = data_loader.get_combination_info(orig_idx)
-            number     = int(combo["number"])
-            lead_month = int(combo["lead_month"])
-            time_val   = pd.Timestamp(combo["time"]).to_datetime64()
+            combo_info = data_loader.get_combination_info(orig_idx)
+            number     = int(combo_info["number"])
+            lead_month = int(combo_info["lead_month"])
+            time_val   = pd.Timestamp(combo_info["time"]).to_datetime64()
+            year       = pd.Timestamp(combo_info["time"]).year
 
-            key = (number, lead_month)
-            if key not in grouped:
-                grouped[key] = {
+            file_key   = (lead_month, year)
+            if file_key not in grouped:
+                grouped[file_key] = {}
+            if number not in grouped[file_key]:
+                grouped[file_key][number] = {
                     "times":   [],
                     "inputs":  {n: [] for n in INPUT_VAR_NAMES},
                     "targets": {n: [] for n in TARGET_VAR_NAMES},
                     "preds":   {n: [] for n in target_vars},
                 }
 
-            grouped[key]["times"].append(time_val)
-
+            g = grouped[file_key][number]
+            g["times"].append(time_val)
             for in_name in INPUT_VAR_NAMES:
-                grouped[key]["inputs"][in_name].append(
-                    raw_inputs[INPUT_CHANNEL_INDEX[in_name]]
-                )
+                g["inputs"][in_name].append(raw_inputs[INPUT_CHANNEL_INDEX[in_name]])
             for i, t_name in enumerate(TARGET_VAR_NAMES):
-                grouped[key]["targets"][t_name].append(raw_tgts[i])
+                g["targets"][t_name].append(raw_tgts[i])
             for t_name in target_vars:
-                grouped[key]["preds"][t_name].append(pred_np[t_name])
+                g["preds"][t_name].append(pred_np[t_name])
 
         processed += B
         if processed % 500 < args.batch_size or processed == len(infer_indices):
@@ -315,31 +321,63 @@ def main():
     lon_vals = data_loader.ds.longitude.values.astype(np.float32)
 
     output_files = []
-    for (number, lead_month), payload in grouped.items():
-        times = np.array(payload["times"])
-        order = np.argsort(times)
-        times_sorted = times[order]
+    for (lead_month, year), member_dict in grouped.items():
+        members_sorted = sorted(member_dict.keys())
+
+        # Build shared time axis from first member (all members share the same times)
+        ref = member_dict[members_sorted[0]]
+        times_sorted = np.sort(np.array(ref["times"]))
 
         data_vars: Dict = {}
-        for in_name, arrays in payload["inputs"].items():
-            stacked = np.stack(arrays, axis=0)[order]
-            data_vars[in_name] = (("time", "latitude", "longitude"), stacked)
-        for t_name, arrays in payload["targets"].items():
-            stacked = np.stack(arrays, axis=0)[order]
-            data_vars[f"{t_name}_target"] = (("time", "latitude", "longitude"), stacked)
-        for t_name, arrays in payload["preds"].items():
-            stacked = np.stack(arrays, axis=0)[order]
-            data_vars[f"{t_name}_pred"] = (("time", "latitude", "longitude"), stacked)
+
+        for in_name in INPUT_VAR_NAMES:
+            arrs = []
+            for m in members_sorted:
+                g = member_dict[m]
+                order = np.argsort(np.array(g["times"]))
+                arrs.append(np.stack(g["inputs"][in_name], axis=0)[order])
+            data_vars[in_name] = (
+                ("member", "time", "latitude", "longitude"),
+                np.stack(arrs, axis=0).astype(np.float32),
+            )
+
+        for t_name in TARGET_VAR_NAMES:
+            arrs = []
+            for m in members_sorted:
+                g = member_dict[m]
+                order = np.argsort(np.array(g["times"]))
+                arrs.append(np.stack(g["targets"][t_name], axis=0)[order])
+            data_vars[f"{t_name}_target"] = (
+                ("member", "time", "latitude", "longitude"),
+                np.stack(arrs, axis=0).astype(np.float32),
+            )
+
+        for t_name in target_vars:
+            arrs = []
+            for m in members_sorted:
+                g = member_dict[m]
+                order = np.argsort(np.array(g["times"]))
+                arrs.append(np.stack(g["preds"][t_name], axis=0)[order])
+            data_vars[f"{t_name}_pred"] = (
+                ("member", "time", "latitude", "longitude"),
+                np.stack(arrs, axis=0).astype(np.float32),
+            )
 
         ds_out = xr.Dataset(
             data_vars=data_vars,
-            coords={"time": times_sorted, "latitude": lat_vals, "longitude": lon_vals},
+            coords={
+                "member":    members_sorted,
+                "time":      times_sorted,
+                "latitude":  lat_vals,
+                "longitude": lon_vals,
+            },
             attrs={
-                "member_number": int(number),
-                "lead_month":    int(lead_month),
+                "lead_month":      int(lead_month),
+                "year":            int(year),
+                "n_members":       len(members_sorted),
                 "years_requested": ",".join(str(y) for y in selected_years),
-                "checkpoint": str(checkpoint_path),
-                "experiment_dir": str(experiment_dir),
+                "checkpoint":      str(checkpoint_path),
+                "experiment_dir":  str(experiment_dir),
             },
         )
         encoding = {
@@ -349,12 +387,13 @@ def main():
         encoding["latitude"]  = {"dtype": "float32"}
         encoding["longitude"] = {"dtype": "float32"}
 
-        out_path = output_dir / f"inference_member_{number}_lead_{lead_month}.nc"
+        out_path = output_dir / f"inference_lead_{lead_month}_year_{year}.nc"
         ds_out.to_netcdf(out_path, encoding=encoding)
         output_files.append(out_path)
 
     print("=" * 80)
     print(f"Saved {len(output_files)} NetCDF files → {output_dir}")
+    print("  Naming: inference_lead_{{lead}}_year_{{year}}.nc  (member dim inside)")
     print("=" * 80)
 
     data_loader.close()

@@ -1,0 +1,176 @@
+# exp_s03_vit_tweedie_dwa_seasonal.yml
+# ──────────────────────────────────────────────────────────────────────────────
+# EXPERIMENT S03 — Seasonal ViT encoder + Tweedie loss (p=1.5) + DWA weighting
+#
+# Builds on exp_s02 (CNN + Tweedie + reflect padding) by swapping the encoder
+# to a Vision Transformer with FiLM lead-time conditioning, and adding DWA
+# task weighting so the Tweedie precipitation loss is up-weighted automatically
+# once the temperature/humidity tasks converge.
+#
+# Architecture notes — ViT on 28×53
+# ──────────────────────────────────
+# PatchEmbedding uses Conv2d(kernel=patch_size, stride=patch_size, padding=0).
+# Both H and W must be divisible by patch_size for zero cropping.
+# 53 is prime, so no patch_size > 1 divides it exactly.
+# Choice: patch_size=4 → H: 28/4=7 (exact), W: 53/4=13 (13×4=52; 1 right-edge
+# column dropped, 1.9% of domain).  The decoder restores full 28×53 via
+# bilinear upsampling.  Alternatives (patch_size=7: 4 columns dropped, 7.5%)
+# are worse.
+#
+# Sequence length = 7×13 + 1 (CLS token) = 92.  With embed_dim=512 and 8
+# heads the attention is trivially cheap on a 28×53 domain — much lighter than
+# for the same encoder applied to the 270×520 grid.
+#
+# FiLM conditioning note
+# ──────────────────────
+# For ViT, FiLM is applied to the spatial feature map AFTER the transformer
+# blocks (not inside the encoder).  FiLM is initialised with γ=1, β=0
+# (identity transform) so it does not disturb the freshly-initialised
+# transformer weights — this ordering is enforced in ClimateNet.__init__.
+#
+# Precipitation-zero artefact (previous ViT runs)
+# ────────────────────────────────────────────────
+# Earlier ViT runs predicted zero precipitation everywhere.  Root cause:
+# the output activation for tpERA was ReLU, which saturated at zero during
+# early training when the model had no strong precipitation gradient signal.
+# Fix: softplus activation (smooth, always >0) + Tweedie deviance loss
+# (MLE objective that naturally handles zero-inflated precipitation).
+# Both fixes are present in this config.
+#
+# Boundary artefact (exp_s01 vertical/horizontal lines)
+# ──────────────────────────────────────────────────────
+# The ViT encoder does not use Conv2d in its core — it uses MLP/attention on
+# patch tokens — so it has no zero-padding boundary bias.  The decoder uses
+# reflect padding (inherited from exp_s02) as an extra safeguard.
+#
+# Key differences from exp_s02:
+#   encoder_type:        cnn  → vit
+#   vit_patch_size:      (new) 4
+#   vit_num_heads:       (new) 8
+#   vit_mlp_ratio:       (new) 4.0
+#   vit_dropout:         (new) 0.1
+#   vit_attention_dropout:(new) 0.1
+#   dilations:           [1,2,4,8,1] → omitted (ViT has no dilation)
+#   weighting_strategy:  equal → dwa
+#   batch_size:          256 → 512  (ViT seq-len=92 is cheap; much more room)
+#   lr:                  1e-5 → 5e-5  (ViT benefits from slightly higher LR
+#                                      with warmup / cosine schedule)
+# ──────────────────────────────────────────────────────────────────────────────
+
+experiment:
+  name: "vit_tweedie_dwa_seasonal"
+  base_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments"
+  output_dir: "/nvme/h/pgeorgiades/data_p185/AI_downscale/NEW_models_2/experiments_seasonal/exp_s03_vit_tweedie_dwa_seasonal"
+  description: "Seasonal bias-correction — ViT encoder + Tweedie (p=1.5) + DWA task weighting"
+
+seed: 42
+
+data:
+  nc_path: "/nvme/h/pgeorgiades/scratch/training_seasonal.nc"
+  cache_dir: "./cache"
+  load_in_memory: true
+  rank0_only_in_memory_load: false
+  rank0_batch_broadcast: false
+  normalize: true
+  normalize_samples: null
+  normalize_method: "minmax"
+  train_years: [1981, 1982, 1983, 1984, 1985, 1986, 1987, 1988, 1989,
+                1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999,
+                2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009,
+                2010, 2011, 2012, 2013]
+  val_years:   [2014, 2015, 2016]
+  test_years:  [2017, 2018, 2019, 2020]
+  num_workers: 12
+
+model:
+  static_channels: 3          # dem, rho, phi
+  dynamic_channels: 16        # tp, t2m, tmax, hurs, sin_t, cos_t, cci×10
+  image_size: [28, 53]        # seasonal grid: 28 lat × 53 lon
+  encoder_type: "vit"
+  encoder_dim: 512             # same as CNN expts; 512/8 heads = 64 head-dim ✓
+  encoder_blocks: 6
+
+  # ── ViT-specific ─────────────────────────────────────────────────────────
+  # patch_size=4: H 28→7 (exact), W 53→13 (52/53 columns covered, 1 dropped).
+  # See header note.  patch_size=7 drops 4 columns (7.5%) — avoid.
+  vit_patch_size: 4
+  vit_num_heads: 8             # 512 / 8 = 64 head-dim; standard for ViT-B
+  vit_mlp_ratio: 4.0           # MLP hidden = 4 × embed_dim = 2048
+  vit_dropout: 0.1
+  vit_attention_dropout: 0.1
+
+  # ── shared encoder/decoder settings ──────────────────────────────────────
+  decoder_type: "multi"
+  decoder_hidden_dims: [512, 256, 128, 64]
+  target_vars: ["tasERA", "tasmaxERA", "tpERA", "rhERA"]
+  output_activations:
+    tpERA: "softplus"          # smooth lower-bounded activation; required by Tweedie
+  use_film: true               # FiLM applied to ViT output [B, D, H', W'] after blocks
+  num_leads: 7                 # lead months 0–6
+  lead_embed_dim: 128
+  padding_mode: "reflect"      # decoder Conv2d padding; guards against edge artefacts
+  # dilations: omitted — ViT encoder does not use dilated convolutions
+
+optimizer:
+  type: "adamw"
+  lr: !!float 5e-5             # matches CNN expts (s01/s02); 1e-6 is too low with cosine→1e-7
+  weight_decay: 0.00005
+  betas: [0.9, 0.999]
+
+scheduler:
+  type: "cosine"
+  min_lr: !!float 1e-7
+  factor: 0.5
+  patience: 5
+  step_size: 30
+  gamma: 0.1
+
+training:
+  # ── batch size rationale (4-GPU DDP) ─────────────────────────────────────
+  # Training set ≈ 33 years × 12 months × 25 members × 7 leads ≈ 69,300 samples.
+  # Effective batch = 4 GPUs × batch_size.
+  #   batch_size=512 → effective 2048 → only ~34 steps/epoch (too few).
+  #   batch_size=64  → effective  256 → ~271 steps/epoch  ✓
+  # ViT on 28×53 is cheap: each transformer layer costs ~0.05 MB/sample at B=64;
+  # decoder activations [64, 512, 7, 13] ≈ 3 MB per layer → <1 GB total.
+  batch_size: 128
+  max_epochs: 150
+  stage1_epochs: 50
+  gradient_clip_val: 1.0
+  early_stopping_patience: 15
+  save_every_n_epochs: 5
+  val_interval: 1
+  use_amp: true
+  device: "cuda"
+
+loss:
+  weighting_strategy: dwa      # DWA re-weights tasks by loss rate-of-change;
+                                # boosts Tweedie tpERA gradient once temp/hurs converge
+  data_loss_types:
+    tasERA:    hybrid
+    tasmaxERA: hybrid
+    tpERA:     tweedie         # Tweedie deviance (compound Poisson-Gamma MLE)
+    rhERA:     hybrid
+  tweedie_power: 1.5           # midpoint between Poisson (1) and Gamma (2)
+  tweedie_eps: !!float 1e-6
+  compositedry_gamma: 1.0
+  compositedry_overestimate_weight: 2.5
+  compositedry_dry_threshold: 0.002
+  compositedry_lambda_extreme: 1.0
+  compositedry_lambda_dry: 0.7
+  wet_weight: 10.0
+  dry_weight: 1.0
+  use_physics: false
+  physics_weight: 0.0
+  use_clausius_clapeyron: false
+  use_temp_consistency: false
+  use_humidity_bounds: false
+  use_precip_nonnegativity: false
+  use_spatial_smoothness: false
+
+logging:
+  log_level: "INFO"
+  log_interval: 50
+
+evaluation:
+  save_predictions: true
